@@ -10,6 +10,7 @@ from cache_decorator import Cache
 from fake_useragent import UserAgent
 from rdkit.Chem.rdchem import Mol
 from rdkit.Chem import MolFromSmiles, MolToSmiles  # pylint: disable=no-name-in-module
+from rdkit import RDLogger  # pylint: disable=no-name-in-module
 
 
 @Cache(use_source_code=False, cache_path="{cache_dir}/{_hash}.json.gz")
@@ -46,7 +47,10 @@ def get_canonical_smiles_classification(canonical_smiles: str) -> Dict:
 
 def get_smiles_classification(smiles: str) -> Optional[Dict]:
     """Get the classifications for a given SMILES."""
+
+    RDLogger.DisableLog("rdApp.error")  # type: ignore
     mol: Optional[Mol] = MolFromSmiles(smiles)
+    RDLogger.EnableLog("rdApp.error")  # type: ignore
 
     if mol is None:
         return None
@@ -77,8 +81,24 @@ def labeler() -> None:
             for spectrum in load_from_mgf(args.input)
             if "smiles" in spectrum.metadata
         )
+    elif args.input.endswith(".tsv"):
+        data = (
+            token.strip()
+            for line in open(args.input, "r", encoding="utf-8")
+            if line.strip() and not line.startswith("#")
+            for token in line.split("\t")
+            if len(token) > 1
+        )
+    elif args.input.endswith(".ssv"):
+        data = (
+            token.strip()
+            for line in open(args.input, "r", encoding="utf-8")
+            if line.strip() and not line.startswith("#")
+            for token in line.split(" ")
+            if len(token) > 1
+        )
     else:
-        raise ValueError("Only MGF files are supported.")
+        raise ValueError("Only MGF, SSV and TSV files are supported.")
 
     classifications: List[Dict] = []
     for smiles in tqdm(

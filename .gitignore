@@ -163,4 +163,5 @@ cython_debug/
 
 matchms.mgf
 CID-SMILES.tsv
+CID-SMILES.ssv
 cache

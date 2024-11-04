@@ -13,3 +13,10 @@ For instance, suppose you want to classify the SMILES in the metadata of an MGF 
 ```bash
 python3 labeler.py --input matchms.mgf --output classified_matchms.json.gz
 ```
+
+Similarly, for a SSV file:
+
+```bash
+python3 labeler.py --input CID-SMILES.ssv --output pubchem.json.gz
+```
+
