@@ -85,11 +85,20 @@ def labeler() -> None:
         description="Retrieve the classification from the original NP Classifier."
     )
     parser.add_argument("--input", type=str, help="Path to the input file.")
-    parser.add_argument("--output", type=str, help="Path to the output file.")
+    parser.add_argument(
+        "--output", type=str, help="Path to the output file.", required=False
+    )
     args: Namespace = parser.parse_args()
 
+    if args.output is None:
+        assert args.input is not None
+        assert args.input.endswith(".mgf")
+        output = args.input.replace(".mgf", ".json.gz")
+    else:
+        output = args.output
+
     if not any(
-        args.output.endswith(extension)
+        output.endswith(extension)
         for extension in (".json.gz", ".json", ".json.xz")
     ):
         raise ValueError("Only JSON output files are supported.")
@@ -147,7 +156,7 @@ def labeler() -> None:
         else:
             failed_classifications.add(smiles)
 
-    compress_json.dump(classifications, args.output)
+    compress_json.dump(classifications, output)
 
     print(
         f"Retrieved classifications for {len(classified_smiles)} unique SMILES, "

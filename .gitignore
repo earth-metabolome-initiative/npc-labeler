@@ -171,3 +171,5 @@ Untitled-1.ipynb
 gnps_cleaned.mgf
 classified_gnps_cleaned.json.gz
 ALL_GNPS_NO_PROPOGATED.mgf
+*.mgf
+*.json.gz
