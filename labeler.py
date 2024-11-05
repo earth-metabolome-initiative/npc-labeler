@@ -66,6 +66,9 @@ def get_smiles_classification(smiles: str) -> Optional[Dict]:
     return get_canonical_smiles_classification(canonical_smiles)
 
 
+KNOWN_COUNTS: Dict[str, int] = {"CID-SMILES.tsv": 119031918}
+
+
 def labeler() -> None:
     """Retrieve the classification from the original NP Classifier."""
 
@@ -116,11 +119,21 @@ def labeler() -> None:
     else:
         raise ValueError("Only MGF, SSV and TSV files are supported.")
 
+    if args.input in KNOWN_COUNTS:
+        total = KNOWN_COUNTS[args.input]
+    else:
+        total = None
+
     classified_smiles: Set[str] = set()
     failed_classifications: Set[str] = set()
     classifications: List[Dict] = []
     for smiles in tqdm(
-        data, desc="Retrieving classifications", unit="smiles", dynamic_ncols=True
+        data,
+        desc="Retrieving classifications",
+        unit="smiles",
+        dynamic_ncols=True,
+        leave=False,
+        total=total,
     ):
         if smiles in classified_smiles:
             continue
