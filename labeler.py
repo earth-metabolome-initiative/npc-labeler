@@ -1,7 +1,9 @@
 """Script to retrieve the classification from the original NP Classifier."""
 
-from typing import Dict, Optional, List
+from typing import Dict, Optional, List, Set
 from argparse import ArgumentParser, Namespace
+import os
+from glob import glob
 import requests
 from tqdm.auto import tqdm
 import compress_json
@@ -18,7 +20,11 @@ def get_canonical_smiles_classification(canonical_smiles: str) -> Dict:
     """Get the classifications for a given SMILES."""
 
     ua = UserAgent()
-    header = {"User-Agent": str(ua.chrome)}
+    header = {
+        "User-Agent": str(ua.chrome),
+        "Accept": "application/json",
+        "Content-Type": "application/json",
+    }
 
     response = requests.get(
         "https://npclassifier.gnps2.org/classify",
@@ -62,6 +68,16 @@ def get_smiles_classification(smiles: str) -> Optional[Dict]:
 
 def labeler() -> None:
     """Retrieve the classification from the original NP Classifier."""
+
+    # We look into the cache directory to remove empty dictionaries
+    # that were created by the cache decorator
+    for path in glob("cache/*.json.gz"):
+        data = compress_json.load(path)
+        if not data:
+            print(f"Removing empty cache file {path}")
+            os.remove(path)
+            os.remove(f"{path}.metadata")
+
     parser = ArgumentParser(
         description="Retrieve the classification from the original NP Classifier."
     )
@@ -100,16 +116,30 @@ def labeler() -> None:
     else:
         raise ValueError("Only MGF, SSV and TSV files are supported.")
 
+    classified_smiles: Set[str] = set()
+    failed_classifications: Set[str] = set()
     classifications: List[Dict] = []
     for smiles in tqdm(
         data, desc="Retrieving classifications", unit="smiles", dynamic_ncols=True
     ):
+        if smiles in classified_smiles:
+            continue
+
         classification = get_smiles_classification(smiles)
 
-        if classification is not None:
+        if classification is not None and classification:
+            classified_smiles.add(smiles)
+            classification["smiles"] = smiles
             classifications.append(classification)
+        else:
+            failed_classifications.add(smiles)
 
-    compress_json.dump(data, args.output)
+    compress_json.dump(classifications, args.output)
+
+    print(
+        f"Retrieved classifications for {len(classified_smiles)} unique SMILES, "
+        f"failed to retrieve classifications for {len(failed_classifications)} unique SMILES."
+    )
 
 
 if __name__ == "__main__":

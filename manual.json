@@ -1,0 +1,8 @@
+{
+    "CC(=O)N(C)CCN(CCN(CCN(CCN(CCN(C)[Na+])C(C)=O)C(C)=O)C(C)=O)C(C)=O": {},
+    "CC(=O)N(C)CCN(CCN(CCN(CCN(CCN(CCN(C)[Na+])C(C)=O)C(C)=O)C(C)=O)C(C)=O)C(C)=O": {},
+    "CC(=O)N(C)CCN(CCN(CCN(CCN(CCN(CCN(CCN(C)[Na+])C(=O)c1ccccc1)C(C)=O)C(C)=O)C(C)=O)C(C)=O)C(C)=O": {},
+    "CC(=O)N(C)CCN(CCN(CCN(CCN(CCN(CCN(CCN(CCN[Na+])C(C)=O)C(C)=O)C(C)=O)C(C)=O)C(C)=O)C(C)=O)C(C)=O": {},
+    "CC(=O)N(C)CCN(CCN(CCN(CCN(CCN(CCN(CCN(CCN(CCN[Na+])C(C)=O)C(C)=O)C(C)=O)C(C)=O)C(C)=O)C(C)=O)C(C)=O)C(C)=O": {},
+    "CC(=O)N(C)CCN(CCN(CCN(CCN(CCN(CCN(CCN(CCN(CCN(CCN(CCN[Na+])C(=O)c1ccccc1)C(C)=O)C(C)=O)C(C)=O)C(C)=O)C(C)=O)C(C)=O)C(C)=O)C(C)=O)C(C)=O": {}
+}

@@ -165,3 +165,9 @@ matchms.mgf
 CID-SMILES.tsv
 CID-SMILES.ssv
 cache
+classified_matchms.json
+classified_matchms.json.gz
+Untitled-1.ipynb
+gnps_cleaned.mgf
+classified_gnps_cleaned.json.gz
+ALL_GNPS_NO_PROPOGATED.mgf
