@@ -3,16 +3,37 @@
 from typing import Dict, Optional, List, Set
 from argparse import ArgumentParser, Namespace
 import os
+from time import time
 from glob import glob
 import requests
-from tqdm.auto import tqdm
 import compress_json
 from matchms.importing import load_from_mgf
 from cache_decorator import Cache
 from fake_useragent import UserAgent
+from humanize import naturaldelta
+from rich.console import Console
+from rich.table import Table
 from rdkit.Chem.rdchem import Mol
-from rdkit.Chem import MolFromSmiles, MolToSmiles  # pylint: disable=no-name-in-module
+from rdkit.Chem import (  # pylint: disable=no-name-in-module
+    MolFromSmarts,
+    MolFromSmiles,
+    MolToSmiles,
+)
 from rdkit import RDLogger  # pylint: disable=no-name-in-module
+
+
+simpleOrganicAtomQuery = MolFromSmarts("[!$([#1,#5,#6,#7,#8,#9,#15,#16,#17,#35,#53])]")
+simpleOrganicBondQuery = MolFromSmarts("[#6]-,=,#,:[#6]")
+hasCHQuery = MolFromSmarts("[C!H0]")
+
+
+def simple_is_organic(mol: Mol) -> bool:
+    """Check if a SMILES seems organic."""
+    return (
+        (not mol.HasSubstructMatch(simpleOrganicAtomQuery))
+        and mol.HasSubstructMatch(hasCHQuery)
+        and mol.HasSubstructMatch(simpleOrganicBondQuery)
+    )
 
 
 @Cache(use_source_code=False, cache_path="{cache_dir}/{_hash}.json.gz")
@@ -51,21 +72,6 @@ def get_canonical_smiles_classification(canonical_smiles: str) -> Dict:
     return {}
 
 
-def get_smiles_classification(smiles: str) -> Optional[Dict]:
-    """Get the classifications for a given SMILES."""
-
-    RDLogger.DisableLog("rdApp.error")  # type: ignore
-    mol: Optional[Mol] = MolFromSmiles(smiles)
-    RDLogger.EnableLog("rdApp.error")  # type: ignore
-
-    if mol is None:
-        return None
-
-    canonical_smiles: str = MolToSmiles(mol)
-
-    return get_canonical_smiles_classification(canonical_smiles)
-
-
 KNOWN_COUNTS: Dict[str, int] = {"CID-SMILES.tsv": 119031918}
 
 
@@ -98,8 +104,7 @@ def labeler() -> None:
         output = args.output
 
     if not any(
-        output.endswith(extension)
-        for extension in (".json.gz", ".json", ".json.xz")
+        output.endswith(extension) for extension in (".json.gz", ".json", ".json.xz")
     ):
         raise ValueError("Only JSON output files are supported.")
 
@@ -133,28 +138,70 @@ def labeler() -> None:
     else:
         total = None
 
+    console: Console = Console()
+    last_printed = time()
+    started = time()
+
     classified_smiles: Set[str] = set()
     failed_classifications: Set[str] = set()
+    inorganics: Set[str] = set()
     classifications: List[Dict] = []
-    for smiles in tqdm(
-        data,
-        desc="Retrieving classifications",
-        unit="smiles",
-        dynamic_ncols=True,
-        leave=False,
-        total=total,
-    ):
+    for smiles in data:
+        if time() - last_printed > 0.5:
+            table: Table = Table(title="NP Classifier")
+            table.add_column("Classified", justify="right")
+            table.add_column("Failed", justify="right")
+            table.add_column("Inorganics", justify="right")
+            table.add_column("Processed", justify="right")
+            table.add_column("Total", justify="right")
+            table.add_column("Elapsed time", justify="right")
+            table.add_column("Remaining time", justify="right")
+            all_smiles_count = (
+                len(classified_smiles) + len(failed_classifications) + len(inorganics)
+            )
+            table.add_row(
+                str(len(classified_smiles)),
+                str(len(failed_classifications)),
+                str(len(inorganics)),
+                str(all_smiles_count),
+                str(total) if total is not None else "Unknown",
+                naturaldelta(time() - started),
+                (
+                    naturaldelta(
+                        (time() - started)
+                        / all_smiles_count
+                        * (total - all_smiles_count)
+                    )
+                    if total is not None
+                    else "Unknown"
+                ),
+            )
+            console.clear()
+            console.print(table)
+
+            last_printed = time()
+
         if smiles in classified_smiles:
             continue
 
-        classification = get_smiles_classification(smiles)
+        RDLogger.DisableLog("rdApp.error")  # type: ignore
+        mol: Optional[Mol] = MolFromSmiles(smiles)
+        RDLogger.EnableLog("rdApp.error")  # type: ignore
+
+        if mol is None:
+            failed_classifications.add(smiles)
+            continue
+
+        if not simple_is_organic(mol):
+            inorganics.add(smiles)
+            continue
+
+        classification = get_canonical_smiles_classification(MolToSmiles(mol))
 
         if classification is not None and classification:
             classified_smiles.add(smiles)
             classification["smiles"] = smiles
             classifications.append(classification)
-        else:
-            failed_classifications.add(smiles)
 
     compress_json.dump(classifications, output)
 
