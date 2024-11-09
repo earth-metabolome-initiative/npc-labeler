@@ -144,27 +144,35 @@ def labeler() -> None:
 
     classified_smiles: Set[str] = set()
     failed_classifications: Set[str] = set()
+    invalid_smiles: Set[str] = set()
     inorganics: Set[str] = set()
     classifications: List[Dict] = []
     for smiles in data:
         if time() - last_printed > 0.5:
             table: Table = Table(title="NP Classifier")
             table.add_column("Classified", justify="right")
-            table.add_column("Failed", justify="right")
+            table.add_column("Failed classifications", justify="right")
+            table.add_column("Invalid SMILES", justify="right")
             table.add_column("Inorganics", justify="right")
             table.add_column("Processed", justify="right")
             table.add_column("Total", justify="right")
+            table.add_column("SMILES/s", justify="right")
             table.add_column("Elapsed time", justify="right")
             table.add_column("Remaining time", justify="right")
             all_smiles_count = (
-                len(classified_smiles) + len(failed_classifications) + len(inorganics)
+                len(classified_smiles)
+                + len(failed_classifications)
+                + len(inorganics)
+                + len(invalid_smiles)
             )
             table.add_row(
                 str(len(classified_smiles)),
                 str(len(failed_classifications)),
+                str(len(invalid_smiles)),
                 str(len(inorganics)),
                 str(all_smiles_count),
                 str(total) if total is not None else "Unknown",
+                f"{all_smiles_count / (time() - started):.2f}",
                 naturaldelta(time() - started),
                 (
                     naturaldelta(
@@ -189,7 +197,7 @@ def labeler() -> None:
         RDLogger.EnableLog("rdApp.error")  # type: ignore
 
         if mol is None:
-            failed_classifications.add(smiles)
+            invalid_smiles.add(smiles)
             continue
 
         if not simple_is_organic(mol):
@@ -198,10 +206,12 @@ def labeler() -> None:
 
         classification = get_canonical_smiles_classification(MolToSmiles(mol))
 
-        if classification is not None and classification:
+        if classification:
             classified_smiles.add(smiles)
             classification["smiles"] = smiles
             classifications.append(classification)
+        else:
+            failed_classifications.add(smiles)
 
     compress_json.dump(classifications, output)
 
