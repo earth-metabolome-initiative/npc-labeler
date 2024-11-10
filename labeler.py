@@ -1,14 +1,16 @@
 """Script to retrieve the classification from the original NP Classifier."""
 
-from typing import Dict, Optional, List, Set
+from typing import Dict, Optional, List, Set, Tuple
 from argparse import ArgumentParser, Namespace
 import os
+from multiprocessing import Pool
 from time import time
 from glob import glob
 import requests
 import compress_json
 from matchms.importing import load_from_mgf
 from cache_decorator import Cache
+from tqdm import tqdm
 from fake_useragent import UserAgent
 from humanize import naturaldelta
 from rich.console import Console
@@ -71,6 +73,20 @@ def get_canonical_smiles_classification(canonical_smiles: str) -> Dict:
 
     return {}
 
+def _get_canonical_smiles_classification(data: Tuple[str, str]) -> Dict:
+    classification = get_canonical_smiles_classification(data[0])
+    classification["smiles"] = data[1]
+    return classification
+
+
+def is_numeric(value: str) -> bool:
+    """Check if a string is numeric."""
+    try:
+        float(value)
+        return True
+    except ValueError:
+        return False
+
 
 KNOWN_COUNTS: Dict[str, int] = {"CID-SMILES.tsv": 119031918}
 
@@ -93,6 +109,13 @@ def labeler() -> None:
     parser.add_argument("--input", type=str, help="Path to the input file.")
     parser.add_argument(
         "--output", type=str, help="Path to the output file.", required=False
+    )
+    parser.add_argument(
+        "--workers",
+        type=int,
+        help="Number of workers to use.",
+        default=1,
+        required=False,
     )
     args: Namespace = parser.parse_args()
 
@@ -120,7 +143,7 @@ def labeler() -> None:
             for line in open(args.input, "r", encoding="utf-8")
             if line.strip() and not line.startswith("#")
             for token in line.split("\t")
-            if len(token) > 1
+            if len(token) > 1 and not is_numeric(token)
         )
     elif args.input.endswith(".ssv"):
         data = (
@@ -128,7 +151,7 @@ def labeler() -> None:
             for line in open(args.input, "r", encoding="utf-8")
             if line.strip() and not line.startswith("#")
             for token in line.split(" ")
-            if len(token) > 1
+            if len(token) > 1 and not is_numeric(token)
         )
     else:
         raise ValueError("Only MGF, SSV and TSV files are supported.")
@@ -147,6 +170,9 @@ def labeler() -> None:
     invalid_smiles: Set[str] = set()
     inorganics: Set[str] = set()
     classifications: List[Dict] = []
+
+    tasks = []
+
     for smiles in data:
         if time() - last_printed > 0.5:
             table: Table = Table(title="NP Classifier")
@@ -172,7 +198,7 @@ def labeler() -> None:
                 str(len(inorganics)),
                 str(all_smiles_count),
                 str(total) if total is not None else "Unknown",
-                f"{all_smiles_count / (time() - started):.2f}",
+                f"{(all_smiles_count) / (time() - started):.2f}",
                 naturaldelta(time() - started),
                 (
                     naturaldelta(
@@ -204,14 +230,37 @@ def labeler() -> None:
             inorganics.add(smiles)
             continue
 
-        classification = get_canonical_smiles_classification(MolToSmiles(mol))
+        tasks.append((MolToSmiles(mol), smiles))
 
-        if classification:
-            classified_smiles.add(smiles)
-            classification["smiles"] = smiles
-            classifications.append(classification)
-        else:
-            failed_classifications.add(smiles)
+        if len(tasks) >= 1000:
+            with Pool(args.workers) as pool:
+                for classification in tqdm(
+                    pool.imap(_get_canonical_smiles_classification, tasks),
+                    total=len(tasks),
+                ):
+                    if classification:
+                        classified_smiles.add(classification["smiles"])
+                        classifications.append(classification)
+                    else:
+                        failed_classifications.add(classification["smiles"])
+                tasks = []
+
+    if len(tasks) >= 1000:
+        with Pool(args.workers) as pool:
+            for classification in tqdm(
+                pool.imap_unordered(_get_canonical_smiles_classification, tasks),
+                total=len(tasks),
+                leave=False,
+                unit="smiles",
+                dynamic_ncols=True,
+            ):
+                if classification:
+                    classified_smiles.add(classification["smiles"])
+                    classifications.append(classification)
+                else:
+                    failed_classifications.add(classification["smiles"])
+            tasks = []
+
 
     compress_json.dump(classifications, output)
 
