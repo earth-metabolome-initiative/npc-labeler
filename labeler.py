@@ -4,13 +4,13 @@ from typing import Dict, Optional, List, Set, Tuple
 from argparse import ArgumentParser, Namespace
 import os
 from multiprocessing import Pool
-from time import time
+from time import time, sleep
 from glob import glob
 import requests
 import compress_json
 from matchms.importing import load_from_mgf
 from cache_decorator import Cache
-from tqdm import tqdm
+from tqdm import tqdm, trange
 from fake_useragent import UserAgent
 from humanize import naturaldelta
 from rich.console import Console
@@ -42,34 +42,41 @@ def simple_is_organic(mol: Mol) -> bool:
 def get_canonical_smiles_classification(canonical_smiles: str) -> Dict:
     """Get the classifications for a given SMILES."""
 
-    ua = UserAgent()
-    header = {
-        "User-Agent": str(ua.chrome),
-        "Accept": "application/json",
-        "Content-Type": "application/json",
-    }
+    while True:
+        try:
+            ua = UserAgent()
+            header = {
+                "User-Agent": str(ua.chrome),
+                "Accept": "application/json",
+                "Content-Type": "application/json",
+            }
 
-    response = requests.get(
-        "https://npclassifier.gnps2.org/classify",
-        params={"smiles": canonical_smiles},
-        headers=header,
-        timeout=10,
-    )
+            response = requests.get(
+                "https://npclassifier.gnps2.org/classify",
+                params={"smiles": canonical_smiles},
+                headers=header,
+                timeout=10,
+            )
 
-    if response.status_code != 200:
-        print(
-            f"Failed to retrieve classifications for {canonical_smiles}, "
-            f" got status code {response.status_code}"
-        )
-        print(response.text)
+            if response.status_code != 200:
+                print(
+                    f"Failed to retrieve classifications for {canonical_smiles}, "
+                    f" got status code {response.status_code}"
+                )
+                print(response.text)
 
-    try:
-        return response.json()
-    except requests.exceptions.JSONDecodeError:
-        print(
-            f"Failed to convert response to JSON for {canonical_smiles}, "
-            f" got status code {response.status_code}, raw response: {response.text}"
-        )
+            try:
+                return response.json()
+            except requests.exceptions.JSONDecodeError:
+                print(
+                    f"Failed to convert response to JSON for {canonical_smiles}, "
+                    f" got status code {response.status_code}, raw response: {response.text}"
+                )
+                return {}
+        except requests.exceptions.ReadTimeout:
+            print(f"Timeout for {canonical_smiles}, retrying...")
+            for _ in trange(60):
+                sleep(1)
 
     return {}
 
@@ -96,7 +103,13 @@ def labeler() -> None:
 
     # We look into the cache directory to remove empty dictionaries
     # that were created by the cache decorator
-    for path in glob("cache/*.json.gz"):
+    for path in tqdm(
+        glob("cache/*.json.gz"),
+        desc="Removing empty dictionaries",
+        unit="path",
+        leave=False,
+        dynamic_ncols=True,
+    ):
         data = compress_json.load(path)
         if not data:
             print(f"Removing empty cache file {path}")
@@ -162,7 +175,7 @@ def labeler() -> None:
         total = None
 
     console: Console = Console()
-    last_printed = time()
+    last_printed = 0
     started = time()
 
     classified_smiles: Set[str] = set()
@@ -198,12 +211,12 @@ def labeler() -> None:
                 str(len(inorganics)),
                 str(all_smiles_count),
                 str(total) if total is not None else "Unknown",
-                f"{(all_smiles_count) / (time() - started):.2f}",
+                f"{(all_smiles_count) / (time() - started + 1):.2f}",
                 naturaldelta(time() - started),
                 (
                     naturaldelta(
                         (time() - started)
-                        / all_smiles_count
+                        / max(all_smiles_count, 1)
                         * (total - all_smiles_count)
                     )
                     if total is not None
@@ -232,7 +245,7 @@ def labeler() -> None:
 
         tasks.append((MolToSmiles(mol), smiles))
 
-        if len(tasks) >= 1000:
+        if len(tasks) >= 100000:
             with Pool(args.workers) as pool:
                 for classification in tqdm(
                     pool.imap(_get_canonical_smiles_classification, tasks),
@@ -245,7 +258,7 @@ def labeler() -> None:
                         failed_classifications.add(classification["smiles"])
                 tasks = []
 
-    if len(tasks) >= 1000:
+    if len(tasks) >= 0:
         with Pool(args.workers) as pool:
             for classification in tqdm(
                 pool.imap_unordered(_get_canonical_smiles_classification, tasks),
