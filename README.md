@@ -81,7 +81,7 @@ Using this utility, we have already labelled SMILES from the following datasets 
 | [BIRMINGHAM-UHPLC-MS-NEG](https://external.gnps2.org/gnpslibrary)                         | Negative spectra from Birmingham UHPLC-MS          | [Download from Zenodo](https://zenodo.org/records/14040990/files/BIRMINGHAM-UHPLC-MS-POS.json.gz?download=1)                         | 549          | 549               |
 | [ALL_GNPS_NO_PROPOGATED](https://external.gnps2.org/gnpslibrary)                          | Spectra from GNPS                                  | [Download from Zenodo](https://zenodo.org/records/14040990/files/ALL_GNPS_NO_PROPOGATED.json.gz?download=1)                          | 75744        | 75587             |
 | [ALL_GNPS](https://external.gnps2.org/gnpslibrary)                                        | Spectra from GNPS                                  | [Download from Zenodo](https://zenodo.org/records/14040990/files/ALL_GNPS.json.gz?download=1)                                        | 75798        | 75640             |
-| [PubChem CID-SMILES](https://ftp.ncbi.nlm.nih.gov/pubchem/Compound/Extras/)               | CID-SMILES from PubChem                            | In progress                                                                                                                          | 119031918    | 11000000          |
+| [PubChem CID-SMILES](https://ftp.ncbi.nlm.nih.gov/pubchem/Compound/Extras/)               | CID-SMILES from PubChem                            | In progress                                                                                                                          | 119031918    | 34299994          |
 
 ### Dataset format
 

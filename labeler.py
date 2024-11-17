@@ -73,7 +73,11 @@ def get_canonical_smiles_classification(canonical_smiles: str) -> Dict:
                     f" got status code {response.status_code}, raw response: {response.text}"
                 )
                 return {}
-        except requests.exceptions.ReadTimeout:
+        except (
+            requests.exceptions.ReadTimeout,
+            requests.exceptions.ConnectTimeout,
+            requests.exceptions.ConnectionError,
+        ):
             print(f"Timeout for {canonical_smiles}, retrying...")
             for _ in trange(60):
                 sleep(1)
