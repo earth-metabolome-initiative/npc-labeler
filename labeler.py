@@ -1,20 +1,16 @@
 """Script to retrieve the classification from the original NP Classifier."""
 
-from typing import Dict, Optional, List, Set, Tuple
+from typing import Dict, Optional, List
 from argparse import ArgumentParser, Namespace
 import os
 from multiprocessing import Pool
-from time import time, sleep
-from glob import glob
+from time import sleep
 import requests
 import compress_json
 from matchms.importing import load_from_mgf
 from cache_decorator import Cache
 from tqdm import tqdm, trange
 from fake_useragent import UserAgent
-from humanize import naturaldelta
-from rich.console import Console
-from rich.table import Table
 from rdkit.Chem.rdchem import Mol
 from rdkit.Chem import (  # pylint: disable=no-name-in-module
     MolFromSmarts,
@@ -41,8 +37,9 @@ def simple_is_organic(mol: Mol) -> bool:
 @Cache(use_source_code=False, cache_path="{cache_dir}/{_hash}.json.gz")
 def get_canonical_smiles_classification(canonical_smiles: str) -> Dict:
     """Get the classifications for a given SMILES."""
+    attempts = 10
 
-    while True:
+    while attempts < 10:
         try:
             ua = UserAgent()
             header = {
@@ -78,15 +75,31 @@ def get_canonical_smiles_classification(canonical_smiles: str) -> Dict:
             requests.exceptions.ConnectTimeout,
             requests.exceptions.ConnectionError,
         ):
-            print(f"Timeout for {canonical_smiles}, retrying...")
+            attempts += 1
+            print(
+                f"Timeout for {canonical_smiles}, attempt {attempts} out of 10, retrying..."
+            )
             for _ in trange(60):
                 sleep(1)
 
     return {}
 
-def _get_canonical_smiles_classification(data: Tuple[str, str]) -> Dict:
-    classification = get_canonical_smiles_classification(data[0])
-    classification["smiles"] = data[1]
+
+def _get_canonical_smiles_classification(smiles: str) -> Optional[Dict]:
+    RDLogger.DisableLog("rdApp.error")  # type: ignore
+    mol: Optional[Mol] = MolFromSmiles(smiles)
+    RDLogger.EnableLog("rdApp.error")  # type: ignore
+
+    if mol is None:
+        return {}
+
+    if not simple_is_organic(mol):
+        return {}
+
+    canonical_smiles = MolToSmiles(mol)
+
+    classification = get_canonical_smiles_classification(canonical_smiles)
+    classification["smiles"] = canonical_smiles
     return classification
 
 
@@ -102,23 +115,21 @@ def is_numeric(value: str) -> bool:
 KNOWN_COUNTS: Dict[str, int] = {"CID-SMILES.tsv": 119031918}
 
 
+def clean(path: str) -> None:
+    """Remove empty cache files."""
+    if path.endswith(".metadata"):
+        return
+    if os.path.getsize(path) > 50:
+        return
+    data = compress_json.load(path)
+    if not data:
+        print(f"Removing empty cache file {path}")
+        os.remove(path)
+        os.remove(f"{path}.metadata")
+
+
 def labeler() -> None:
     """Retrieve the classification from the original NP Classifier."""
-
-    # We look into the cache directory to remove empty dictionaries
-    # that were created by the cache decorator
-    for path in tqdm(
-        glob("cache/*.json.gz"),
-        desc="Removing empty dictionaries",
-        unit="path",
-        leave=False,
-        dynamic_ncols=True,
-    ):
-        data = compress_json.load(path)
-        if not data:
-            print(f"Removing empty cache file {path}")
-            os.remove(path)
-            os.remove(f"{path}.metadata")
 
     parser = ArgumentParser(
         description="Retrieve the classification from the original NP Classifier."
@@ -135,6 +146,18 @@ def labeler() -> None:
         required=False,
     )
     args: Namespace = parser.parse_args()
+
+    with os.scandir("cache") as it:
+        # We look into the cache directory to remove empty dictionaries
+        # that were created by the cache decorator
+        with Pool(args.workers) as pool:
+            for _ in tqdm(
+                pool.imap_unordered(clean, (entry.path for entry in it), 1000),
+                desc="Removing empty cache files",
+            ):
+                pass
+            pool.close()
+            pool.join()
 
     if args.output is None:
         assert args.input is not None
@@ -178,113 +201,16 @@ def labeler() -> None:
     else:
         total = None
 
-    console: Console = Console()
-    last_printed = 0
-    started = time()
-
-    classified_smiles: Set[str] = set()
-    failed_classifications: Set[str] = set()
-    invalid_smiles: Set[str] = set()
-    inorganics: Set[str] = set()
     classifications: List[Dict] = []
 
-    tasks = []
-
-    for smiles in data:
-        if time() - last_printed > 0.5:
-            table: Table = Table(title="NP Classifier")
-            table.add_column("Classified", justify="right")
-            table.add_column("Failed classifications", justify="right")
-            table.add_column("Invalid SMILES", justify="right")
-            table.add_column("Inorganics", justify="right")
-            table.add_column("Processed", justify="right")
-            table.add_column("Total", justify="right")
-            table.add_column("SMILES/s", justify="right")
-            table.add_column("Elapsed time", justify="right")
-            table.add_column("Remaining time", justify="right")
-            all_smiles_count = (
-                len(classified_smiles)
-                + len(failed_classifications)
-                + len(inorganics)
-                + len(invalid_smiles)
-            )
-            table.add_row(
-                str(len(classified_smiles)),
-                str(len(failed_classifications)),
-                str(len(invalid_smiles)),
-                str(len(inorganics)),
-                str(all_smiles_count),
-                str(total) if total is not None else "Unknown",
-                f"{(all_smiles_count) / (time() - started + 1):.2f}",
-                naturaldelta(time() - started),
-                (
-                    naturaldelta(
-                        (time() - started)
-                        / max(all_smiles_count, 1)
-                        * (total - all_smiles_count)
-                    )
-                    if total is not None
-                    else "Unknown"
-                ),
-            )
-            console.clear()
-            console.print(table)
-
-            last_printed = time()
-
-        if smiles in classified_smiles:
-            continue
-
-        RDLogger.DisableLog("rdApp.error")  # type: ignore
-        mol: Optional[Mol] = MolFromSmiles(smiles)
-        RDLogger.EnableLog("rdApp.error")  # type: ignore
-
-        if mol is None:
-            invalid_smiles.add(smiles)
-            continue
-
-        if not simple_is_organic(mol):
-            inorganics.add(smiles)
-            continue
-
-        tasks.append((MolToSmiles(mol), smiles))
-
-        if len(tasks) >= 100000:
-            with Pool(args.workers) as pool:
-                for classification in tqdm(
-                    pool.imap(_get_canonical_smiles_classification, tasks),
-                    total=len(tasks),
-                ):
-                    if classification:
-                        classified_smiles.add(classification["smiles"])
-                        classifications.append(classification)
-                    else:
-                        failed_classifications.add(classification["smiles"])
-                tasks = []
-
-    if len(tasks) >= 0:
-        with Pool(args.workers) as pool:
-            for classification in tqdm(
-                pool.imap_unordered(_get_canonical_smiles_classification, tasks),
-                total=len(tasks),
-                leave=False,
-                unit="smiles",
-                dynamic_ncols=True,
-            ):
-                if classification:
-                    classified_smiles.add(classification["smiles"])
-                    classifications.append(classification)
-                else:
-                    failed_classifications.add(classification["smiles"])
-            tasks = []
-
+    with Pool(args.workers) as pool:
+        for classification in tqdm(
+            pool.imap(_get_canonical_smiles_classification, data), total=total
+        ):
+            if classification:
+                classifications.append(classification)
 
     compress_json.dump(classifications, output)
-
-    print(
-        f"Retrieved classifications for {len(classified_smiles)} unique SMILES, "
-        f"failed to retrieve classifications for {len(failed_classifications)} unique SMILES."
-    )
 
 
 if __name__ == "__main__":

@@ -173,3 +173,4 @@ classified_gnps_cleaned.json.gz
 ALL_GNPS_NO_PROPOGATED.mgf
 *.mgf
 *.json.gz
+*.tar.gz
