@@ -52,6 +52,7 @@ struct RuntimeConfig {
     ntfy_base: Option<String>,
     publish_interval: Duration,
     retry_delays: [Duration; 3],
+    require_zenodo_token: bool,
     install_ctrlc: bool,
 }
 
@@ -66,6 +67,7 @@ impl RuntimeConfig {
             ntfy_base: Some(NTFY_BASE.to_string()),
             publish_interval: PUBLISH_INTERVAL,
             retry_delays: RETRY_DELAYS,
+            require_zenodo_token: true,
             install_ctrlc: true,
         }
     }
@@ -125,6 +127,7 @@ fn run(args: &Args) -> io::Result<()> {
 
 #[allow(clippy::too_many_lines)]
 fn run_with_config(args: &Args, config: &RuntimeConfig) -> io::Result<()> {
+    let zenodo_token = zenodo_token_from_env(config.require_zenodo_token)?;
     let input_path = Path::new(&args.input);
     let total_rows = count_input_rows(input_path)?;
 
@@ -204,6 +207,7 @@ fn run_with_config(args: &Args, config: &RuntimeConfig) -> io::Result<()> {
                 &mut chunk_index,
                 counts,
                 config,
+                zenodo_token.as_deref(),
                 &agent,
                 ntfy_url.as_deref(),
             )?;
@@ -443,6 +447,16 @@ fn print_summary(counts: RuntimeCounts) {
     println!("Pending:    {}", counts.pending());
 }
 
+fn zenodo_token_from_env(require_token: bool) -> io::Result<Option<String>> {
+    match std::env::var("ZENODO_TOKEN") {
+        Ok(token) if !token.trim().is_empty() => Ok(Some(token)),
+        _ if require_token => Err(io::Error::other(
+            "ZENODO_TOKEN is not set; refusing to start without a Zenodo access token",
+        )),
+        _ => Ok(None),
+    }
+}
+
 fn should_send_daily_status(now_utc: DateTime<Utc>, last_sent_date: Option<NaiveDate>) -> bool {
     now_utc.hour() >= DAILY_STATUS_HOUR_UTC && Some(now_utc.date_naive()) != last_sent_date
 }
@@ -484,21 +498,20 @@ fn zenodo_release_complete_message(doi: &str, counts: RuntimeCounts) -> String {
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn publish_to_zenodo(
     writer: &mut ChunkWriter,
     state: &mut StateStore,
     chunk_index: &mut ChunkIndex,
     counts: RuntimeCounts,
     config: &RuntimeConfig,
+    zenodo_token: Option<&str>,
     agent: &ureq::Agent,
     ntfy_url: Option<&str>,
 ) -> io::Result<()> {
-    let zenodo_token = match std::env::var("ZENODO_TOKEN") {
-        Ok(token) if !token.is_empty() => token,
-        _ => {
-            eprintln!("[zenodo] ZENODO_TOKEN not set, skipping publish");
-            return Ok(());
-        }
+    let Some(zenodo_token) = zenodo_token else {
+        eprintln!("[zenodo] ZENODO_TOKEN not set, skipping publish");
+        return Ok(());
     };
 
     sync_runtime_state(writer, state, chunk_index)?;
@@ -514,7 +527,7 @@ fn publish_to_zenodo(
     )?;
 
     match zenodo::publish(
-        &zenodo_token,
+        zenodo_token,
         &release.output_path,
         &release.manifest_path,
         counts.successful,
@@ -643,6 +656,7 @@ mod tests {
                 Duration::from_millis(0),
                 Duration::from_millis(0),
             ],
+            require_zenodo_token: false,
             install_ctrlc: false,
         };
         let args = Args {
@@ -715,6 +729,7 @@ mod tests {
         assert_eq!(config.release_dir, PathBuf::from(RELEASE_DIR));
         assert_eq!(config.api_url, api::DEFAULT_API_URL);
         assert!(config.ntfy_base.is_some());
+        assert!(config.require_zenodo_token);
         assert!(config.install_ctrlc);
     }
 
@@ -750,6 +765,41 @@ mod tests {
         assert!(zenodo_message.contains("Zenodo release complete: 10.1234/mock"));
         assert!(zenodo_message.contains("handled 6/10 samples"));
         assert!(zenodo_message.contains("successful=3"));
+    }
+
+    #[test]
+    fn zenodo_token_requirement_is_enforced() {
+        let _guard = env_lock();
+        let previous = std::env::var("ZENODO_TOKEN").ok();
+        unsafe {
+            std::env::remove_var("ZENODO_TOKEN");
+        }
+
+        let error = zenodo_token_from_env(true).expect_err("missing token should fail");
+        assert!(error.to_string().contains("ZENODO_TOKEN is not set"));
+        assert!(
+            zenodo_token_from_env(false)
+                .expect("optional token")
+                .is_none()
+        );
+
+        unsafe {
+            std::env::set_var("ZENODO_TOKEN", "token-value");
+        }
+        assert_eq!(
+            zenodo_token_from_env(true).expect("required token"),
+            Some("token-value".to_string())
+        );
+
+        if let Some(previous) = previous {
+            unsafe {
+                std::env::set_var("ZENODO_TOKEN", previous);
+            }
+        } else {
+            unsafe {
+                std::env::remove_var("ZENODO_TOKEN");
+            }
+        }
     }
 
     #[test]
@@ -856,6 +906,7 @@ mod tests {
             ntfy_base: None,
             publish_interval: Duration::from_hours(168),
             retry_delays: [Duration::from_millis(0); 3],
+            require_zenodo_token: false,
             install_ctrlc: false,
         };
 
@@ -894,15 +945,29 @@ mod tests {
         let _guard = env_lock();
         let temp_dir = TestDir::new("run-wrapper");
         let previous_dir = std::env::current_dir().expect("current dir");
+        let previous_token = std::env::var("ZENODO_TOKEN").ok();
         let input_path = temp_dir.path().join("empty.txt");
         std::fs::write(&input_path, "").expect("write empty input");
 
         std::env::set_current_dir(temp_dir.path()).expect("enter temp dir");
+        unsafe {
+            std::env::set_var("ZENODO_TOKEN", "token-value");
+        }
         let args = Args {
             input: input_path.to_string_lossy().into_owned(),
         };
         let result = run(&args);
         std::env::set_current_dir(previous_dir).expect("restore current dir");
+
+        if let Some(previous_token) = previous_token {
+            unsafe {
+                std::env::set_var("ZENODO_TOKEN", previous_token);
+            }
+        } else {
+            unsafe {
+                std::env::remove_var("ZENODO_TOKEN");
+            }
+        }
 
         result.expect("run wrapper");
     }
@@ -938,6 +1003,7 @@ mod tests {
             ntfy_base: Some(ntfy_server.url("/topic")),
             publish_interval: Duration::ZERO,
             retry_delays: [Duration::from_millis(0); 3],
+            require_zenodo_token: false,
             install_ctrlc: false,
         };
         let args = Args {
@@ -1026,6 +1092,7 @@ mod tests {
             ntfy_base: None,
             publish_interval: Duration::from_hours(168),
             retry_delays: [Duration::from_millis(0); 3],
+            require_zenodo_token: false,
             install_ctrlc: false,
         };
         let counts = RuntimeCounts {
@@ -1042,6 +1109,7 @@ mod tests {
             &mut chunk_index,
             counts,
             &config,
+            None,
             &agent,
             None,
         )
