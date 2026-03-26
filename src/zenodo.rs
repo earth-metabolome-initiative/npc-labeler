@@ -1,5 +1,4 @@
 use std::fs::File;
-use std::io::Read;
 use std::path::Path;
 
 const ZENODO_API: &str = "https://zenodo.org/api";
@@ -157,17 +156,15 @@ pub fn publish(
         file_size as f64 / 1_048_576.0
     );
 
-    let mut file =
+    let file =
         File::open(parquet_path).map_err(|e| format!("failed to open {parquet_path}: {e}"))?;
-    let mut data = Vec::with_capacity(file_size as usize);
-    file.read_to_end(&mut data)
-        .map_err(|e| format!("failed to read {parquet_path}: {e}"))?;
-
+    let content_length = file_size.to_string();
     agent
         .put(&format!("{bucket_url}/{filename}"))
         .set("Authorization", &format!("Bearer {token}"))
         .set("Content-Type", "application/octet-stream")
-        .send_bytes(&data)
+        .set("Content-Length", &content_length)
+        .send(file)
         .map_err(|e| format!("failed to upload file: {e}"))?;
 
     // 6. Publish
