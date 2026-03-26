@@ -7,7 +7,8 @@ A tool to build an open-source training dataset for natural product classificati
 
 NPClassifier classifies natural products into pathways, superclasses, and classes. The model is not open source: the authors host it as a web service but do not release the model weights or training data. This project queries the API for all ~123M PubChem SMILES and stores the results in a SQLite database, creating a fully open dataset that can be used to train an open-source replacement.
 
-*We do not recommend running this tool yourself. We are already running it and publishing updated snapshots of the dataset to [Zenodo](https://doi.org/10.5281/zenodo.14040990) on a weekly cadence. The code is shared for transparency and reproducibility. If you need the classification data, please use the Zenodo dataset rather than placing additional load on the NPClassifier API.*
+> [!IMPORTANT]
+> *We do not recommend running this tool yourself. We are already running it and publishing updated snapshots of the dataset to [Zenodo](https://doi.org/10.5281/zenodo.14040990) on a weekly cadence. The code is shared for transparency and reproducibility. If you need the classification data, please use the Zenodo dataset rather than placing additional load on the NPClassifier API.*
 
 ## Dashboard
 
