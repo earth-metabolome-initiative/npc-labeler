@@ -11,6 +11,7 @@ use std::time::Instant;
 
 pub struct Ui {
     interactive: bool,
+    ntfy_url: Option<String>,
     started_at: Instant,
     current_smiles: Option<String>,
     current_cid: Option<i32>,
@@ -33,9 +34,14 @@ impl Drop for TerminalGuard {
 }
 
 impl Ui {
-    pub fn new(_ntfy_url: String) -> Self {
+    pub fn new(ntfy_url: String) -> Self {
         Self {
             interactive: io::stderr().is_terminal(),
+            ntfy_url: if ntfy_url.is_empty() {
+                None
+            } else {
+                Some(ntfy_url)
+            },
             started_at: Instant::now(),
             current_smiles: None,
             current_cid: None,
@@ -104,24 +110,7 @@ impl Ui {
         let uptime = self.started_at.elapsed().as_secs().max(1);
         let rate = self.session_requests as f64 / uptime as f64;
         let (width, height) = size().unwrap_or((120, 12));
-
-        let lines = vec![
-            format!(
-                "NPClassifier scraper    {}",
-                Local::now().format("%Y-%m-%d %H:%M:%S")
-            ),
-            format!("uptime={}s | req_rate={:.2}/s", uptime, rate),
-            format!(
-                "current: CID {} | {}",
-                self.current_cid
-                    .map_or("idle".to_string(), |c| c.to_string()),
-                self.current_smiles.as_deref().unwrap_or(""),
-            ),
-            self.last_result.as_ref().map_or_else(
-                || "last result: none".to_string(),
-                |v| format!("last result: {v}"),
-            ),
-        ];
+        let lines = self.dashboard_lines(uptime, rate);
 
         let mut stderr = io::stderr();
         queue!(
@@ -142,6 +131,30 @@ impl Ui {
         stderr.flush()?;
         Ok(())
     }
+
+    fn dashboard_lines(&self, uptime: u64, rate: f64) -> Vec<String> {
+        let mut lines = vec![
+            format!(
+                "NPClassifier scraper    {}",
+                Local::now().format("%Y-%m-%d %H:%M:%S")
+            ),
+            format!("uptime={}s | req_rate={:.2}/s", uptime, rate),
+        ];
+        if let Some(ntfy_url) = &self.ntfy_url {
+            lines.push(format!("ntfy subscribe: {ntfy_url}"));
+        }
+        lines.push(format!(
+            "current: CID {} | {}",
+            self.current_cid
+                .map_or("idle".to_string(), |c| c.to_string()),
+            self.current_smiles.as_deref().unwrap_or(""),
+        ));
+        lines.push(self.last_result.as_ref().map_or_else(
+            || "last result: none".to_string(),
+            |v| format!("last result: {v}"),
+        ));
+        lines
+    }
 }
 
 #[cfg(test)]
@@ -149,6 +162,7 @@ impl Ui {
     pub(crate) fn test_noninteractive() -> Self {
         Self {
             interactive: false,
+            ntfy_url: None,
             started_at: Instant::now(),
             current_smiles: None,
             current_cid: None,
@@ -160,6 +174,7 @@ impl Ui {
     pub(crate) fn test_interactive() -> Self {
         Self {
             interactive: true,
+            ntfy_url: None,
             started_at: Instant::now(),
             current_smiles: None,
             current_cid: None,
@@ -206,6 +221,7 @@ mod tests {
     fn note_current_truncates_long_smiles_and_updates_result_fields() {
         let mut ui = Ui {
             interactive: false,
+            ntfy_url: None,
             started_at: Instant::now(),
             current_smiles: None,
             current_cid: None,
@@ -234,6 +250,7 @@ mod tests {
     fn render_non_interactive_smoke_test() {
         let mut ui = Ui {
             interactive: false,
+            ntfy_url: None,
             started_at: Instant::now(),
             current_smiles: Some("CCO".to_string()),
             current_cid: Some(7),
@@ -275,10 +292,14 @@ mod tests {
     #[test]
     fn render_dashboard_and_write_styled_line_smoke_tests() {
         let mut ui = Ui::test_interactive();
+        ui.ntfy_url = Some("https://ntfy.sh/test-topic".to_string());
         ui.current_smiles = Some("CCO".to_string());
         ui.current_cid = Some(7);
         ui.last_result = Some("empty CID 7".to_string());
         ui.session_requests = 3;
+
+        let lines = ui.dashboard_lines(1, 3.0);
+        assert!(lines.iter().any(|line| line.contains("ntfy subscribe:")));
 
         ui.render_dashboard().expect("render dashboard");
         ui.render();
