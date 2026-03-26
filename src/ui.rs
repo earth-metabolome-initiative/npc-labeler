@@ -1,4 +1,3 @@
-use crate::db::{self, LabelCount};
 use chrono::Local;
 use crossterm::cursor::{Hide, MoveTo, Show};
 use crossterm::queue;
@@ -7,26 +6,8 @@ use crossterm::terminal::{
     BeginSynchronizedUpdate, Clear, ClearType, DisableLineWrap, EnableLineWrap,
     EndSynchronizedUpdate, EnterAlternateScreen, LeaveAlternateScreen, size,
 };
-use std::collections::VecDeque;
 use std::io::{self, IsTerminal, Write};
-use std::time::{Duration, Instant};
-
-const MAX_EVENTS: usize = 10;
-const MAX_ERRORS: usize = 5;
-const CACHE_TTL: Duration = Duration::from_mins(1);
-
-struct DbCache {
-    total: i64,
-    classified: i64,
-    empty: i64,
-    invalid: i64,
-    failed: i64,
-    pending: i64,
-    top_pathways: Vec<LabelCount>,
-    top_superclasses: Vec<LabelCount>,
-    top_classes: Vec<LabelCount>,
-    last_refresh: Instant,
-}
+use std::time::Instant;
 
 pub struct Ui {
     interactive: bool,
@@ -35,14 +16,6 @@ pub struct Ui {
     current_cid: Option<i32>,
     last_result: Option<String>,
     session_requests: u64,
-    session_classified: u64,
-    session_empty: u64,
-    session_invalid: u64,
-    session_errors: u64,
-    recent_events: VecDeque<String>,
-    recent_errors: VecDeque<String>,
-    ntfy_url: String,
-    cache: DbCache,
 }
 
 pub struct TerminalGuard {
@@ -60,7 +33,7 @@ impl Drop for TerminalGuard {
 }
 
 impl Ui {
-    pub fn new(ntfy_url: String) -> Self {
+    pub fn new(_ntfy_url: String) -> Self {
         Self {
             interactive: io::stderr().is_terminal(),
             started_at: Instant::now(),
@@ -68,25 +41,6 @@ impl Ui {
             current_cid: None,
             last_result: None,
             session_requests: 0,
-            session_classified: 0,
-            session_empty: 0,
-            session_invalid: 0,
-            session_errors: 0,
-            recent_events: VecDeque::new(),
-            recent_errors: VecDeque::new(),
-            ntfy_url,
-            cache: DbCache {
-                total: 0,
-                classified: 0,
-                empty: 0,
-                invalid: 0,
-                failed: 0,
-                pending: 0,
-                top_pathways: Vec::new(),
-                top_superclasses: Vec::new(),
-                top_classes: Vec::new(),
-                last_refresh: Instant::now().checked_sub(CACHE_TTL).unwrap(),
-            },
         }
     }
 
@@ -110,70 +64,35 @@ impl Ui {
     }
 
     pub fn note_classified(&mut self, cid: i32) {
-        self.session_classified += 1;
-        let msg = format!("classified CID {cid}");
-        self.last_result = Some(msg.clone());
-        push_ring(&mut self.recent_events, MAX_EVENTS, &msg);
+        self.last_result = Some(format!("classified CID {cid}"));
     }
 
     pub fn note_empty(&mut self, cid: i32) {
-        self.session_empty += 1;
-        let msg = format!("empty CID {cid}");
-        self.last_result = Some(msg.clone());
-        push_ring(&mut self.recent_events, MAX_EVENTS, &msg);
+        self.last_result = Some(format!("empty CID {cid}"));
     }
 
     pub fn note_invalid(&mut self, cid: i32) {
-        self.session_invalid += 1;
-        let msg = format!("invalid CID {cid}");
-        self.last_result = Some(msg.clone());
-        push_ring(&mut self.recent_events, MAX_EVENTS, &msg);
+        self.last_result = Some(format!("invalid CID {cid}"));
     }
 
     pub fn note_error(&mut self, cid: i32, error: &str) {
-        self.session_errors += 1;
-        let msg = format!("error CID {cid}: {error}");
-        self.last_result = Some(format!("error CID {cid}"));
-        push_ring(&mut self.recent_errors, MAX_ERRORS, &msg);
+        self.last_result = Some(format!("error CID {cid}: {error}"));
     }
 
     pub fn note_rate_limit(&mut self, cid: i32) {
-        let msg = format!("rate limited CID {cid}, sleeping 30s");
-        push_ring(&mut self.recent_events, MAX_EVENTS, &msg);
+        self.last_result = Some(format!("rate limited CID {cid}"));
     }
 
-    fn refresh_cache(&mut self, conn: &mut diesel::SqliteConnection) {
-        if self.cache.last_refresh.elapsed() < CACHE_TTL {
-            return;
-        }
-        self.cache.total = db::count_total(conn);
-        self.cache.classified = db::count_by_status(conn, "classified");
-        self.cache.empty = db::count_by_status(conn, "empty");
-        self.cache.invalid = db::count_by_status(conn, "invalid");
-        self.cache.failed = db::count_by_status(conn, "failed");
-        self.cache.pending = db::count_by_status(conn, "pending");
-        self.cache.top_pathways = db::top_labels(conn, "pathway_results", 5);
-        self.cache.top_superclasses = db::top_labels(conn, "superclass_results", 5);
-        self.cache.top_classes = db::top_labels(conn, "class_results", 5);
-        self.cache.last_refresh = Instant::now();
-    }
-
-    pub fn render(&mut self, conn: &mut diesel::SqliteConnection) {
-        self.refresh_cache(conn);
-
+    pub fn render(&mut self) {
         if !self.interactive {
             let uptime = self.started_at.elapsed().as_secs().max(1);
             let rate = self.session_requests as f64 / uptime as f64;
-            let done =
-                self.cache.classified + self.cache.empty + self.cache.invalid + self.cache.failed;
-            let pct = done as f64 / self.cache.total.max(1) as f64 * 100.0;
+            let current = self
+                .current_cid
+                .map_or_else(|| "idle".to_string(), |cid| format!("CID {cid}"));
+            let last_result = self.last_result.as_deref().unwrap_or("none");
             eprintln!(
-                "[progress] {done}/{} ({pct:.1}%) | {rate:.1}/s | classified={} empty={} invalid={} errors={}",
-                self.cache.total,
-                self.session_classified,
-                self.session_empty,
-                self.session_invalid,
-                self.session_errors
+                "[progress] uptime={uptime}s | req_rate={rate:.1}/s | current={current} | last={last_result}"
             );
             return;
         }
@@ -184,20 +103,9 @@ impl Ui {
     fn render_dashboard(&self) -> io::Result<()> {
         let uptime = self.started_at.elapsed().as_secs().max(1);
         let rate = self.session_requests as f64 / uptime as f64;
-        let (width, height) = size().unwrap_or((120, 36));
+        let (width, height) = size().unwrap_or((120, 12));
 
-        // Live counts: cached baseline + session deltas
-        let total = self.cache.total;
-        let classified = self.cache.classified + self.session_classified as i64;
-        let empty = self.cache.empty + self.session_empty as i64;
-        let invalid = self.cache.invalid + self.session_invalid as i64;
-        let failed = self.cache.failed;
-        let pending = self.cache.pending
-            - self.session_classified as i64
-            - self.session_empty as i64
-            - self.session_invalid as i64;
-
-        let mut lines = vec![
+        let lines = vec![
             format!(
                 "NPClassifier scraper    {}",
                 Local::now().format("%Y-%m-%d %H:%M:%S")
@@ -213,30 +121,7 @@ impl Ui {
                 || "last result: none".to_string(),
                 |v| format!("last result: {v}"),
             ),
-            format!(
-                "session: requests={} classified={} empty={} invalid={} errors={}",
-                self.session_requests,
-                self.session_classified,
-                self.session_empty,
-                self.session_invalid,
-                self.session_errors
-            ),
-            format!(
-                "db: total={total} classified={classified} empty={empty} invalid={invalid} failed={failed} pending={pending}"
-            ),
-            format!("ntfy: {}", self.ntfy_url),
         ];
-
-        lines.push("top pathways:".to_string());
-        push_label_lines(&mut lines, &self.cache.top_pathways);
-        lines.push("top superclasses:".to_string());
-        push_label_lines(&mut lines, &self.cache.top_superclasses);
-        lines.push("top classes:".to_string());
-        push_label_lines(&mut lines, &self.cache.top_classes);
-        lines.push("recent events:".to_string());
-        push_recent(&mut lines, &self.recent_events, "(none)");
-        lines.push("recent errors:".to_string());
-        push_recent(&mut lines, &self.recent_errors, "(none)");
 
         let mut stderr = io::stderr();
         queue!(
@@ -259,30 +144,28 @@ impl Ui {
     }
 }
 
-fn push_ring(ring: &mut VecDeque<String>, max: usize, msg: &str) {
-    if ring.len() >= max {
-        ring.pop_front();
+#[cfg(test)]
+impl Ui {
+    pub(crate) fn test_noninteractive() -> Self {
+        Self {
+            interactive: false,
+            started_at: Instant::now(),
+            current_smiles: None,
+            current_cid: None,
+            last_result: None,
+            session_requests: 0,
+        }
     }
-    ring.push_back(format!("[{}] {msg}", Local::now().format("%H:%M:%S")));
-}
 
-fn push_label_lines(lines: &mut Vec<String>, labels: &[LabelCount]) {
-    if labels.is_empty() {
-        lines.push("  (none)".to_string());
-        return;
-    }
-    for l in labels {
-        lines.push(format!("  {} = {}", l.label, l.cnt));
-    }
-}
-
-fn push_recent(lines: &mut Vec<String>, events: &VecDeque<String>, empty: &str) {
-    if events.is_empty() {
-        lines.push(format!("  {empty}"));
-        return;
-    }
-    for event in events {
-        lines.push(format!("  {event}"));
+    pub(crate) fn test_interactive() -> Self {
+        Self {
+            interactive: true,
+            started_at: Instant::now(),
+            current_smiles: None,
+            current_cid: None,
+            last_result: None,
+            session_requests: 0,
+        }
     }
 }
 
@@ -290,11 +173,11 @@ fn ellipsize(s: &str, width: usize) -> String {
     if s.chars().count() <= width.saturating_sub(1) {
         return s.to_string();
     }
-    if width <= 2 {
+    if width <= 4 {
         return ".".to_string();
     }
-    let mut t: String = s.chars().take(width - 2).collect();
-    t.push('…');
+    let mut t: String = s.chars().take(width - 4).collect();
+    t.push_str("...");
     t
 }
 
@@ -309,42 +192,108 @@ fn write_styled_line(stderr: &mut io::Stderr, line: &str, width: usize) -> io::R
             ResetColor,
             SetAttribute(Attribute::Reset)
         )?;
-    } else if is_section(&line) {
-        queue!(
-            stderr,
-            SetForegroundColor(Color::DarkBlue),
-            SetAttribute(Attribute::Bold),
-            Print(&line),
-            ResetColor,
-            SetAttribute(Attribute::Reset)
-        )?;
-    } else if line.contains("error") && line.starts_with("  [") {
-        queue!(
-            stderr,
-            SetForegroundColor(Color::DarkRed),
-            Print(&line),
-            ResetColor
-        )?;
-    } else if line.starts_with("  [") {
-        queue!(
-            stderr,
-            SetForegroundColor(Color::DarkGreen),
-            Print(&line),
-            ResetColor
-        )?;
     } else {
         queue!(stderr, Print(&line))?;
     }
     Ok(())
 }
 
-fn is_section(line: &str) -> bool {
-    matches!(
-        line,
-        "top pathways:"
-            | "top superclasses:"
-            | "top classes:"
-            | "recent events:"
-            | "recent errors:"
-    )
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn note_current_truncates_long_smiles_and_updates_result_fields() {
+        let mut ui = Ui {
+            interactive: false,
+            started_at: Instant::now(),
+            current_smiles: None,
+            current_cid: None,
+            last_result: None,
+            session_requests: 0,
+        };
+
+        ui.note_current(
+            42,
+            "CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC",
+        );
+        ui.note_classified(42);
+
+        assert_eq!(ui.current_cid, Some(42));
+        assert!(
+            ui.current_smiles
+                .as_deref()
+                .expect("smiles")
+                .ends_with("...")
+        );
+        assert_eq!(ui.last_result.as_deref(), Some("classified CID 42"));
+        assert_eq!(ui.session_requests, 1);
+    }
+
+    #[test]
+    fn render_non_interactive_smoke_test() {
+        let mut ui = Ui {
+            interactive: false,
+            started_at: Instant::now(),
+            current_smiles: Some("CCO".to_string()),
+            current_cid: Some(7),
+            last_result: Some("empty CID 7".to_string()),
+            session_requests: 3,
+        };
+
+        ui.render();
+    }
+
+    #[test]
+    fn ellipsize_handles_narrow_and_wide_widths() {
+        assert_eq!(ellipsize("abcdef", 10), "abcdef");
+        assert_eq!(ellipsize("abcdef", 4), ".");
+        assert_eq!(ellipsize("abcdef", 6), "ab...");
+    }
+
+    #[test]
+    fn enter_terminal_returns_none_when_ui_is_non_interactive() {
+        let ui = Ui::test_noninteractive();
+
+        assert!(ui.enter_terminal().is_none());
+    }
+
+    #[test]
+    fn note_helpers_cover_remaining_status_messages() {
+        let mut ui = Ui::test_noninteractive();
+
+        ui.note_empty(7);
+        assert_eq!(ui.last_result.as_deref(), Some("empty CID 7"));
+        ui.note_invalid(8);
+        assert_eq!(ui.last_result.as_deref(), Some("invalid CID 8"));
+        ui.note_error(9, "boom");
+        assert_eq!(ui.last_result.as_deref(), Some("error CID 9: boom"));
+        ui.note_rate_limit(10);
+        assert_eq!(ui.last_result.as_deref(), Some("rate limited CID 10"));
+    }
+
+    #[test]
+    fn render_dashboard_and_write_styled_line_smoke_tests() {
+        let mut ui = Ui::test_interactive();
+        ui.current_smiles = Some("CCO".to_string());
+        ui.current_cid = Some(7);
+        ui.last_result = Some("empty CID 7".to_string());
+        ui.session_requests = 3;
+
+        ui.render_dashboard().expect("render dashboard");
+        ui.render();
+
+        let terminal = ui.enter_terminal();
+        drop(terminal);
+
+        let mut stderr = io::stderr();
+        write_styled_line(&mut stderr, "NPClassifier scraper", 80).expect("title line");
+        write_styled_line(&mut stderr, "plain line", 80).expect("plain line");
+    }
+
+    #[test]
+    fn inactive_terminal_guard_drop_is_a_noop() {
+        let guard = TerminalGuard { active: false };
+        drop(guard);
+    }
 }

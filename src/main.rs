@@ -1,242 +1,151 @@
 mod api;
-mod db;
-mod export;
-mod models;
-mod schema;
+mod failure_log;
+mod output;
+mod state;
+#[cfg(test)]
+mod test_support;
 mod ui;
 mod zenodo;
 
-use std::io::{BufRead, BufReader};
+use std::fs::File;
+use std::io::{self, BufRead, BufReader};
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::thread;
 use std::time::{Duration, Instant};
 
-use chrono::Utc;
 use clap::Parser;
-use diesel::RunQueryDsl;
 use flate2::read::GzDecoder;
 
-use api::ClassifyError;
-use models::{ClassificationUpdate, NewClassification};
+use api::{ApiResponse, ClassifyError};
+use failure_log::FailureLogger;
+use output::{ChunkIndex, ChunkWriter, build_release, cleanup_completed_dir};
+use state::{LineIndex, StateStore};
 use ui::Ui;
 
-const MAX_ATTEMPTS: i32 = 3;
+const COMPLETED_DIR: &str = "completed";
+const LOG_DIR: &str = "logs";
 const NTFY_BASE: &str = "https://ntfy.sh";
+const PUBLISH_INTERVAL: Duration = Duration::from_hours(168);
+const RELEASE_DIR: &str = "releases";
+const RETRY_DELAYS: [Duration; 3] = [
+    Duration::from_secs(1),
+    Duration::from_secs(5),
+    Duration::from_secs(15),
+];
+const STATE_DIR: &str = "state";
+const STATE_SYNC_INTERVAL: Duration = Duration::from_secs(5);
+const STATE_SYNC_ROWS: u64 = 1_000;
+const TARGET_CHUNK_BYTES: u64 = 128 * 1024 * 1024;
 const DASHBOARD_INTERVAL: Duration = Duration::from_secs(2);
-const PUBLISH_INTERVAL: Duration = Duration::from_hours(168); // 7 days
+
+#[derive(Clone)]
+struct RuntimeConfig {
+    completed_dir: PathBuf,
+    state_dir: PathBuf,
+    log_dir: PathBuf,
+    release_dir: PathBuf,
+    api_url: String,
+    ntfy_base: Option<String>,
+    publish_interval: Duration,
+    retry_delays: [Duration; 3],
+    install_ctrlc: bool,
+}
+
+impl RuntimeConfig {
+    fn production() -> Self {
+        Self {
+            completed_dir: PathBuf::from(COMPLETED_DIR),
+            state_dir: PathBuf::from(STATE_DIR),
+            log_dir: PathBuf::from(LOG_DIR),
+            release_dir: PathBuf::from(RELEASE_DIR),
+            api_url: api::DEFAULT_API_URL.to_string(),
+            ntfy_base: Some(NTFY_BASE.to_string()),
+            publish_interval: PUBLISH_INTERVAL,
+            retry_delays: RETRY_DELAYS,
+            install_ctrlc: true,
+        }
+    }
+}
 
 #[derive(Parser)]
 #[command(name = "npc-labeler")]
-#[command(about = "Classify PubChem SMILES using the NPClassifier API")]
+#[command(about = "Stream PubChem SMILES through the NPClassifier API")]
 struct Args {
-    /// Path to CID-SMILES input file (.gz or plain). Omit to resume from existing DB.
-    #[arg(long)]
-    input: Option<String>,
-
-    /// Path to `SQLite` database
-    #[arg(long, default_value = "classifications.sqlite")]
-    db: String,
+    /// Path to CID-SMILES input file (.gz or plain).
+    #[arg(long, default_value = "CID-SMILES.gz")]
+    input: String,
 }
 
-fn load_smiles(conn: &mut diesel::SqliteConnection, input_path: &str) {
-    eprintln!("Loading SMILES from {input_path}...");
-    let file = match std::fs::File::open(input_path) {
-        Ok(f) => f,
-        Err(e) => {
-            eprintln!("Error: cannot open {input_path}: {e}");
-            std::process::exit(1);
-        }
-    };
-
-    let reader: Box<dyn BufRead> = if std::path::Path::new(input_path)
-        .extension()
-        .is_some_and(|ext| ext.eq_ignore_ascii_case("gz"))
-    {
-        Box::new(BufReader::with_capacity(
-            8 * 1024 * 1024,
-            GzDecoder::new(file),
-        ))
-    } else {
-        Box::new(BufReader::with_capacity(8 * 1024 * 1024, file))
-    };
-
-    let mut batch: Vec<(i32, String)> = Vec::with_capacity(10_000);
-    let mut total_lines: u64 = 0;
-    let mut inserted: u64 = 0;
-
-    for line in reader.lines() {
-        let line = match line {
-            Ok(l) => l,
-            Err(e) => {
-                eprintln!("Warning: skipping unreadable line: {e}");
-                continue;
-            }
-        };
-        let Some((cid_str, smiles)) = line.split_once('\t') else {
-            continue;
-        };
-        let Ok(cid) = cid_str.parse::<i32>() else {
-            continue;
-        };
-
-        batch.push((cid, smiles.trim().to_string()));
-        total_lines += 1;
-
-        if batch.len() >= 10_000 {
-            flush_batch(conn, &batch, &mut inserted);
-            batch.clear();
-            if total_lines.is_multiple_of(100_000) {
-                eprintln!("[load] {total_lines} lines read, {inserted} inserted");
-            }
-        }
-    }
-
-    if !batch.is_empty() {
-        flush_batch(conn, &batch, &mut inserted);
-    }
-
-    eprintln!("[load] done: {total_lines} lines read, {inserted} inserted");
+#[derive(Clone, Copy)]
+struct RuntimeCounts {
+    total: u64,
+    successful: u64,
+    invalid: u64,
+    failed: u64,
 }
 
-fn flush_batch(conn: &mut diesel::SqliteConnection, batch: &[(i32, String)], inserted: &mut u64) {
-    let rows: Vec<NewClassification> = batch
-        .iter()
-        .map(|(cid, smiles)| NewClassification {
-            cid: *cid,
-            smiles: smiles.as_str(),
-            status: "pending",
-        })
-        .collect();
-    match db::bulk_insert(conn, &rows) {
-        Ok(n) => *inserted += n as u64,
-        Err(e) => eprintln!("Warning: batch insert error: {e}"),
+impl RuntimeCounts {
+    fn processed(self) -> u64 {
+        self.successful + self.invalid + self.failed
+    }
+
+    fn pending(self) -> u64 {
+        self.total.saturating_sub(self.processed())
     }
 }
 
-fn make_update(result: Result<api::ApiResponse, ClassifyError>) -> (ClassificationUpdate, bool) {
-    let now = Utc::now().naive_utc();
-    match result {
-        Ok(resp) => {
-            let has_results = !resp.class_results.is_empty()
-                || !resp.superclass_results.is_empty()
-                || !resp.pathway_results.is_empty();
-            let update = ClassificationUpdate {
-                class_results: Some(serde_json::to_string(&resp.class_results).unwrap()),
-                superclass_results: Some(serde_json::to_string(&resp.superclass_results).unwrap()),
-                pathway_results: Some(serde_json::to_string(&resp.pathway_results).unwrap()),
-                isglycoside: Some(resp.isglycoside),
-                status: if has_results { "classified" } else { "empty" }.to_string(),
-                classified_at: Some(now),
-                ..Default::default()
-            };
-            (update, true)
-        }
-        Err(ClassifyError::InvalidSmiles) => {
-            let update = ClassificationUpdate {
-                status: "invalid".to_string(),
-                last_error: Some("Invalid SMILES (HTTP 500)".to_string()),
-                classified_at: Some(now),
-                ..Default::default()
-            };
-            (update, true)
-        }
-        Err(ClassifyError::RateLimit) => {
-            let update = ClassificationUpdate {
-                last_error: Some("Rate limited (HTTP 429)".to_string()),
-                ..Default::default()
-            };
-            (update, false)
-        }
-        Err(e) => {
-            let msg = match &e {
-                ClassifyError::ServerError(code) => format!("Server error (HTTP {code})"),
-                ClassifyError::ParseError(detail) => format!("JSON parse error: {detail}"),
-                ClassifyError::NetworkError(msg) => format!("Network error: {msg}"),
-                _ => unreachable!(),
-            };
-            let update = ClassificationUpdate {
-                status: "failed".to_string(),
-                last_error: Some(msg),
-                ..Default::default()
-            };
-            (update, true)
-        }
-    }
+enum RowOutcome {
+    Success(ApiResponse),
+    Invalid,
+    Failed {
+        attempt: u8,
+        kind: String,
+        message: String,
+    },
+    Interrupted,
 }
 
-fn notify(agent: &ureq::Agent, ntfy_url: &str, message: &str) {
-    if let Err(e) = agent.post(ntfy_url).send_string(message) {
-        eprintln!("[ntfy] failed to send notification: {e}");
-    }
-}
-
-fn publish_to_zenodo(conn: &mut diesel::SqliteConnection, agent: &ureq::Agent, ntfy_url: &str) {
-    let zenodo_token = match std::env::var("ZENODO_TOKEN") {
-        Ok(t) if !t.is_empty() => t,
-        _ => {
-            eprintln!("[zenodo] ZENODO_TOKEN not set, skipping publish");
-            return;
-        }
-    };
-
-    let total = db::count_total(conn);
-    let classified = db::count_by_status(conn, "classified");
-    let empty = db::count_by_status(conn, "empty");
-    let done = classified + empty;
-
-    let parquet_path = "classifications.parquet";
-    eprintln!("[publish] exporting {done} rows to {parquet_path}...");
-    export::export_parquet(conn, parquet_path);
-
-    eprintln!("[publish] uploading to Zenodo...");
-    match zenodo::publish(&zenodo_token, parquet_path, classified, empty, total) {
-        Ok(doi) => {
-            notify(
-                agent,
-                ntfy_url,
-                &format!("Published to Zenodo: {doi} ({done}/{total})"),
-            );
-        }
-        Err(e) => {
-            eprintln!("[zenodo] publish failed: {e}");
-            notify(agent, ntfy_url, &format!("Zenodo publish FAILED: {e}"));
-        }
-    }
-
-    let _ = std::fs::remove_file(parquet_path);
-}
-
-#[allow(clippy::too_many_lines)]
 fn main() {
     dotenvy::dotenv().ok();
 
     let args = Args::parse();
-    let mut conn = db::initialize(&args.db);
-
-    if let Some(ref input) = args.input {
-        load_smiles(&mut conn, input);
+    if let Err(error) = run(&args) {
+        eprintln!("Error: {error}");
+        std::process::exit(1);
     }
+}
 
-    let total = db::count_total(&mut conn);
-    let pending = db::count_by_status(&mut conn, "pending");
+fn run(args: &Args) -> io::Result<()> {
+    run_with_config(args, &RuntimeConfig::production())
+}
 
-    if pending == 0 {
-        eprintln!("DB: {total} total, 0 pending. Nothing to do.");
-        return;
+#[allow(clippy::too_many_lines)]
+fn run_with_config(args: &Args, config: &RuntimeConfig) -> io::Result<()> {
+    let input_path = Path::new(&args.input);
+    let total_rows = count_input_rows(input_path)?;
+
+    let mut chunk_index = ChunkIndex::open(&config.state_dir.join("chunks.jsonl"))?;
+    cleanup_completed_dir(&config.completed_dir, &chunk_index)?;
+
+    let mut state = StateStore::open(&config.state_dir, total_rows as usize)?;
+    let done_rows = state.rebuild_done_from_chunks(chunk_index.records())?;
+    let mut counts = RuntimeCounts {
+        total: u64::from(total_rows),
+        successful: done_rows,
+        invalid: state.count_invalid(),
+        failed: state.count_failed(),
+    };
+
+    if counts.processed() >= counts.total {
+        print_summary(counts);
+        return Ok(());
     }
 
     let shutdown = Arc::new(AtomicBool::new(false));
-    {
-        let s = shutdown.clone();
-        ctrlc::set_handler(move || {
-            if s.load(Ordering::Relaxed) {
-                eprintln!("\nForce exit.");
-                std::process::exit(1);
-            }
-            eprintln!("\nShutdown requested, finishing current request...");
-            s.store(true, Ordering::SeqCst);
-        })
-        .expect("Error setting Ctrl-C handler");
+    if config.install_ctrlc {
+        install_ctrlc_handler(&shutdown)?;
     }
 
     let agent = ureq::AgentBuilder::new()
@@ -245,161 +154,807 @@ fn main() {
         .timeout_connect(Duration::from_secs(10))
         .build();
 
-    let ntfy_topic = uuid::Uuid::new_v4().to_string();
-    let ntfy_url = format!("{NTFY_BASE}/{ntfy_topic}");
-
-    let mut ui = Ui::new(ntfy_url.clone());
-
-    eprintln!("[ntfy] subscribe for updates: {ntfy_url}");
-    notify(
-        &agent,
-        &ntfy_url,
-        &format!("npc-labeler started: {pending}/{total} pending"),
-    );
-
+    let ntfy_url = config
+        .ntfy_base
+        .as_ref()
+        .map(|base| format!("{base}/{}", uuid::Uuid::new_v4()));
+    let mut ui = Ui::new(ntfy_url.clone().unwrap_or_default());
     let terminal = ui.enter_terminal();
 
-    // Main classification loop with periodic Zenodo publish
-    let mut consecutive_db_errors: u32 = 0;
-    let initial_done = total - pending;
-    let mut last_notified_pct: u64 = (initial_done as f64 / total as f64 * 100.0) as u64;
+    let mut writer = ChunkWriter::new(
+        &config.completed_dir,
+        TARGET_CHUNK_BYTES,
+        chunk_index.next_chunk_id(),
+    )?;
+    let mut failure_log = FailureLogger::open(&config.log_dir)?;
+
+    if let Some(ref url) = ntfy_url {
+        eprintln!("[ntfy] subscribe for updates: {url}");
+    }
+    notify(
+        &agent,
+        ntfy_url.as_deref(),
+        &format!(
+            "npc-labeler started: {}/{} processed",
+            counts.processed(),
+            counts.total
+        ),
+    );
+
     let mut last_dashboard = Instant::now();
     let mut last_publish = Instant::now();
-    let start = Instant::now();
-    let mut classified_this_pass: u64 = 0;
+    let mut last_state_sync = Instant::now();
+    let mut last_notified_pct = percent(counts.processed(), counts.total);
+    let mut terminal_updates_since_sync = 0_u64;
+    let mut line_index: LineIndex = 0;
 
-    loop {
+    let reader = open_input_reader(input_path)?;
+    for line_result in reader.lines() {
         if shutdown.load(Ordering::Relaxed) {
             break;
         }
 
-        // Weekly publish check
-        if last_publish.elapsed() >= PUBLISH_INTERVAL {
-            publish_to_zenodo(&mut conn, &agent, &ntfy_url);
+        if last_publish.elapsed() >= config.publish_interval {
+            publish_to_zenodo(
+                &mut writer,
+                &mut state,
+                &mut chunk_index,
+                counts,
+                config,
+                &agent,
+                ntfy_url.as_deref(),
+            )?;
             last_publish = Instant::now();
         }
 
-        let Some((cid, smiles)) = db::get_next_pending(&mut conn) else {
-            break;
+        let line = line_result?;
+        let Some((cid, smiles)) = parse_input_line(&line) else {
+            continue;
         };
 
-        ui.note_current(cid, &smiles);
+        let current_line = line_index;
+        line_index = line_index
+            .checked_add(1)
+            .ok_or_else(|| io::Error::other("line index overflow"))?;
 
-        let result = api::classify(&agent, &smiles);
-
-        match &result {
-            Ok(_) => {}
-            Err(ClassifyError::RateLimit) => ui.note_rate_limit(cid),
-            Err(ClassifyError::InvalidSmiles) => ui.note_invalid(cid),
-            Err(e) => ui.note_error(cid, &format!("{e:?}")),
-        }
-
-        let (update, increment_attempts) = make_update(result);
-        let status = update.status.clone();
-
-        if let Err(e) = db::update_one(&mut conn, cid, update, increment_attempts) {
-            consecutive_db_errors += 1;
-            ui.note_error(cid, &format!("DB error: {e}"));
-            if consecutive_db_errors >= 10 {
-                break;
-            }
-            let _ = diesel::sql_query(
-                "UPDATE classifications SET status = 'failed', last_error = 'DB write error', attempts = attempts + 1 WHERE cid = ?"
-            )
-            .bind::<diesel::sql_types::Integer, _>(cid)
-            .execute(&mut conn);
+        if state.is_terminal(current_line) {
             continue;
         }
 
-        consecutive_db_errors = 0;
-
-        match status.as_str() {
-            "classified" => ui.note_classified(cid),
-            "empty" => ui.note_empty(cid),
-            _ => {}
+        ui.note_current(cid, &smiles);
+        match classify_with_retry(
+            &agent,
+            &config.api_url,
+            &config.retry_delays,
+            cid,
+            &smiles,
+            &mut ui,
+            &shutdown,
+        ) {
+            RowOutcome::Success(response) => {
+                let has_labels = has_labels(&response);
+                writer.append(current_line, cid, &smiles, response)?;
+                counts.successful += 1;
+                terminal_updates_since_sync += 1;
+                if has_labels {
+                    ui.note_classified(cid);
+                } else {
+                    ui.note_empty(cid);
+                }
+            }
+            RowOutcome::Invalid => {
+                state.mark_invalid(current_line);
+                counts.invalid += 1;
+                terminal_updates_since_sync += 1;
+                ui.note_invalid(cid);
+            }
+            RowOutcome::Failed {
+                attempt,
+                kind,
+                message,
+            } => {
+                state.mark_failed(current_line);
+                failure_log.log(current_line, cid, &smiles, &kind, &message, attempt)?;
+                counts.failed += 1;
+                terminal_updates_since_sync += 1;
+                ui.note_error(cid, &message);
+            }
+            RowOutcome::Interrupted => break,
         }
 
-        if increment_attempts {
-            classified_this_pass += 1;
+        if terminal_updates_since_sync >= STATE_SYNC_ROWS
+            || last_state_sync.elapsed() >= STATE_SYNC_INTERVAL
+        {
+            sync_runtime_state(&mut writer, &mut state, &mut chunk_index)?;
+            terminal_updates_since_sync = 0;
+            last_state_sync = Instant::now();
         }
 
         if last_dashboard.elapsed() >= DASHBOARD_INTERVAL {
-            ui.render(&mut conn);
-            last_dashboard = Instant::now();
-
-            let done = initial_done + classified_this_pass as i64;
-            let pct = done as f64 / total as f64 * 100.0;
-            let pct_int = pct as u64;
-            if pct_int > last_notified_pct {
-                let rate = classified_this_pass as f64 / start.elapsed().as_secs_f64();
+            ui.render();
+            let pct = percent(counts.processed(), counts.total);
+            if pct > last_notified_pct {
                 notify(
                     &agent,
-                    &ntfy_url,
-                    &format!("{pct_int}% -- {done}/{total} ({rate:.1}/s)"),
+                    ntfy_url.as_deref(),
+                    &format!("{pct}% -- {}/{}", counts.processed(), counts.total),
                 );
-                last_notified_pct = pct_int;
+                last_notified_pct = pct;
             }
-        }
-
-        if classified_this_pass > 0 && classified_this_pass.is_multiple_of(10_000) {
-            db::wal_checkpoint(&mut conn);
+            last_dashboard = Instant::now();
         }
     }
+
+    if !shutdown.load(Ordering::Relaxed) && line_index != total_rows {
+        return Err(io::Error::other(format!(
+            "counted {total_rows} valid rows during prepass but streamed {line_index}"
+        )));
+    }
+
+    sync_runtime_state(&mut writer, &mut state, &mut chunk_index)?;
+    let _ = writer.seal_current(&mut state, &mut chunk_index)?;
 
     drop(terminal);
 
-    // Retry failed rows
-    if !shutdown.load(Ordering::Relaxed) {
-        for round in 1..MAX_ATTEMPTS {
-            let reset = db::reset_failed_for_retry(&mut conn, MAX_ATTEMPTS);
-            if reset == 0 {
-                break;
-            }
-            eprintln!("--- Retry round {round}: {reset} failed rows ---");
-            // Simple retry loop without dashboard
-            loop {
-                if shutdown.load(Ordering::Relaxed) {
-                    break;
-                }
-                let Some((cid, smiles)) = db::get_next_pending(&mut conn) else {
-                    break;
+    notify(
+        &agent,
+        ntfy_url.as_deref(),
+        &format!(
+            "npc-labeler finished: {}/{} processed",
+            counts.processed(),
+            counts.total
+        ),
+    );
+    print_summary(counts);
+
+    Ok(())
+}
+
+fn classify_with_retry(
+    agent: &ureq::Agent,
+    api_url: &str,
+    retry_delays: &[Duration; 3],
+    cid: i32,
+    smiles: &str,
+    ui: &mut Ui,
+    shutdown: &AtomicBool,
+) -> RowOutcome {
+    let mut attempt = 1_u8;
+    loop {
+        let result = if api_url == api::DEFAULT_API_URL {
+            api::classify(agent, smiles)
+        } else {
+            api::classify_at(agent, api_url, smiles)
+        };
+        match result {
+            Ok(response) => return RowOutcome::Success(response),
+            Err(ClassifyError::InvalidSmiles) => return RowOutcome::Invalid,
+            Err(error) => {
+                let kind = error.kind().to_string();
+                let message = error.message();
+                let Some(delay) = retry_delays.get((attempt - 1) as usize) else {
+                    return RowOutcome::Failed {
+                        attempt,
+                        kind,
+                        message,
+                    };
                 };
-                let result = api::classify(&agent, &smiles);
-                let (update, inc) = make_update(result);
-                if let Err(e) = db::update_one(&mut conn, cid, update, inc) {
-                    eprintln!("DB error on retry CID {cid}: {e}");
+
+                if matches!(error, ClassifyError::RateLimit) {
+                    ui.note_rate_limit(cid);
+                } else {
+                    ui.note_error(cid, &format!("{message}; retrying in {}s", delay.as_secs()));
                 }
+
+                if sleep_with_shutdown(*delay, shutdown) {
+                    return RowOutcome::Interrupted;
+                }
+                attempt += 1;
             }
-            if shutdown.load(Ordering::Relaxed) {
-                break;
+        }
+    }
+}
+
+fn count_input_rows(path: &Path) -> io::Result<LineIndex> {
+    let mut total = 0_u32;
+    let reader = open_input_reader(path)?;
+    for line_result in reader.lines() {
+        let line = line_result?;
+        if parse_input_line(&line).is_some() {
+            total = total
+                .checked_add(1)
+                .ok_or_else(|| io::Error::other("input has more than u32::MAX valid rows"))?;
+        }
+    }
+    Ok(total)
+}
+
+fn has_labels(response: &ApiResponse) -> bool {
+    !response.class_results.is_empty()
+        || !response.superclass_results.is_empty()
+        || !response.pathway_results.is_empty()
+}
+
+fn install_ctrlc_handler(shutdown: &Arc<AtomicBool>) -> io::Result<()> {
+    let signal = shutdown.clone();
+    ctrlc::set_handler(move || {
+        if signal.load(Ordering::Relaxed) {
+            eprintln!("\nForce exit.");
+            std::process::exit(1);
+        }
+        eprintln!("\nShutdown requested, finishing current request...");
+        signal.store(true, Ordering::SeqCst);
+    })
+    .map_err(|error| io::Error::other(error.to_string()))
+}
+
+fn notify(agent: &ureq::Agent, ntfy_url: Option<&str>, message: &str) {
+    let Some(ntfy_url) = ntfy_url else {
+        return;
+    };
+    if let Err(error) = agent.post(ntfy_url).send_string(message) {
+        eprintln!("[ntfy] failed to send notification: {error}");
+    }
+}
+
+fn open_input_reader(path: &Path) -> io::Result<Box<dyn BufRead>> {
+    let file = File::open(path)?;
+    if path
+        .extension()
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("gz"))
+    {
+        return Ok(Box::new(BufReader::with_capacity(
+            8 * 1024 * 1024,
+            GzDecoder::new(file),
+        )));
+    }
+    Ok(Box::new(BufReader::with_capacity(8 * 1024 * 1024, file)))
+}
+
+fn parse_input_line(line: &str) -> Option<(i32, String)> {
+    let (cid, smiles) = line.split_once('\t')?;
+    let cid = cid.parse::<i32>().ok()?;
+    Some((cid, smiles.trim().to_string()))
+}
+
+fn percent(done: u64, total: u64) -> u64 {
+    if total == 0 {
+        return 100;
+    }
+    ((done as f64 / total as f64) * 100.0) as u64
+}
+
+fn print_summary(counts: RuntimeCounts) {
+    println!("\n=== Summary ===");
+    println!("Total:      {}", counts.total);
+    println!("Successful: {}", counts.successful);
+    println!("Invalid:    {}", counts.invalid);
+    println!("Failed:     {}", counts.failed);
+    println!("Pending:    {}", counts.pending());
+}
+
+fn publish_to_zenodo(
+    writer: &mut ChunkWriter,
+    state: &mut StateStore,
+    chunk_index: &mut ChunkIndex,
+    counts: RuntimeCounts,
+    config: &RuntimeConfig,
+    agent: &ureq::Agent,
+    ntfy_url: Option<&str>,
+) -> io::Result<()> {
+    let zenodo_token = match std::env::var("ZENODO_TOKEN") {
+        Ok(token) if !token.is_empty() => token,
+        _ => {
+            eprintln!("[zenodo] ZENODO_TOKEN not set, skipping publish");
+            return Ok(());
+        }
+    };
+
+    sync_runtime_state(writer, state, chunk_index)?;
+    let _ = writer.seal_current(state, chunk_index)?;
+
+    let release = build_release(
+        &config.completed_dir,
+        &config.release_dir,
+        chunk_index,
+        counts.successful,
+        counts.invalid,
+        counts.failed,
+    )?;
+
+    match zenodo::publish(
+        &zenodo_token,
+        &release.output_path,
+        &release.manifest_path,
+        counts.successful,
+        counts.invalid,
+        counts.failed,
+    ) {
+        Ok(doi) => {
+            notify(
+                agent,
+                ntfy_url,
+                &format!("Published to Zenodo: {doi} ({} rows)", counts.successful),
+            );
+            std::fs::remove_file(&release.output_path)?;
+            std::fs::remove_file(&release.manifest_path)?;
+        }
+        Err(error) => {
+            eprintln!("[zenodo] publish failed: {error}");
+            notify(agent, ntfy_url, &format!("Zenodo publish FAILED: {error}"));
+        }
+    }
+
+    Ok(())
+}
+
+fn sleep_with_shutdown(duration: Duration, shutdown: &AtomicBool) -> bool {
+    let started = Instant::now();
+    while started.elapsed() < duration {
+        if shutdown.load(Ordering::Relaxed) {
+            return true;
+        }
+        let remaining = duration.saturating_sub(started.elapsed());
+        thread::sleep(remaining.min(Duration::from_millis(200)));
+    }
+    shutdown.load(Ordering::Relaxed)
+}
+
+fn sync_runtime_state(
+    writer: &mut ChunkWriter,
+    state: &mut StateStore,
+    chunk_index: &mut ChunkIndex,
+) -> io::Result<()> {
+    let _ = writer.sync_active()?;
+    state.sync_terminal()?;
+    if writer.should_rotate()? {
+        let _ = writer.seal_current(state, chunk_index)?;
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::test_support::{MockHttpServer, MockResponse, TestDir};
+    use flate2::Compression;
+    use flate2::write::GzEncoder;
+    use std::fs::read_to_string;
+    use std::io::Write;
+    use std::sync::{Mutex, OnceLock};
+    use zstd::stream::read::Decoder;
+
+    #[test]
+    fn parse_input_line_rejects_invalid_rows() {
+        assert_eq!(parse_input_line("123\tCCO"), Some((123, "CCO".to_string())));
+        assert_eq!(parse_input_line("nope\tCCO"), None);
+        assert_eq!(parse_input_line("123"), None);
+    }
+
+    #[test]
+    fn counts_only_valid_rows_in_plain_and_gzip_inputs() {
+        let temp_dir = TestDir::new("main");
+        let plain_path = temp_dir.path().join("CID-SMILES.txt");
+        let gzip_path = temp_dir.path().join("CID-SMILES.gz");
+        let payload = "1\tCCO\ninvalid\n2\tCCC\nbad\tDDD\n3\t\n";
+
+        std::fs::write(&plain_path, payload).expect("write plain input");
+
+        let gzip_file = File::create(&gzip_path).expect("create gzip input");
+        let mut encoder = GzEncoder::new(gzip_file, Compression::default());
+        encoder
+            .write_all(payload.as_bytes())
+            .expect("write gzip payload");
+        encoder.finish().expect("finish gzip payload");
+
+        assert_eq!(count_input_rows(&plain_path).expect("count plain rows"), 3);
+        assert_eq!(count_input_rows(&gzip_path).expect("count gzip rows"), 3);
+    }
+
+    #[test]
+    fn run_with_config_processes_stream_end_to_end() {
+        let temp_dir = TestDir::new("run");
+        let input_path = temp_dir.path().join("CID-SMILES.txt");
+        std::fs::write(&input_path, "1\tCCO\n2\tCCC\n3\tDDD\n4\tEEE\n").expect("write input file");
+
+        let server = MockHttpServer::spawn(vec![
+            MockResponse::json(
+                "200 OK",
+                r#"{"class_results":["lipid"],"superclass_results":[],"pathway_results":[],"isglycoside":false}"#,
+            ),
+            MockResponse::json(
+                "200 OK",
+                r#"{"class_results":[],"superclass_results":[],"pathway_results":[],"isglycoside":false}"#,
+            ),
+            MockResponse::empty("500 Internal Server Error"),
+            MockResponse::empty("503 Service Unavailable"),
+            MockResponse::empty("503 Service Unavailable"),
+            MockResponse::empty("503 Service Unavailable"),
+            MockResponse::empty("503 Service Unavailable"),
+        ]);
+
+        let config = RuntimeConfig {
+            completed_dir: temp_dir.path().join("completed"),
+            state_dir: temp_dir.path().join("state"),
+            log_dir: temp_dir.path().join("logs"),
+            release_dir: temp_dir.path().join("releases"),
+            api_url: server.url("/classify"),
+            ntfy_base: None,
+            publish_interval: Duration::from_hours(168),
+            retry_delays: [
+                Duration::from_millis(0),
+                Duration::from_millis(0),
+                Duration::from_millis(0),
+            ],
+            install_ctrlc: false,
+        };
+        let args = Args {
+            input: input_path.to_string_lossy().into_owned(),
+        };
+
+        run_with_config(&args, &config).expect("run streaming pipeline");
+
+        let chunk_path = config.completed_dir.join("part-000001.jsonl.zst");
+        let decoder = Decoder::new(File::open(&chunk_path).expect("open chunk")).expect("decoder");
+        let lines = BufReader::new(decoder)
+            .lines()
+            .collect::<Result<Vec<_>, _>>()
+            .expect("read completed records");
+        assert_eq!(lines.len(), 2);
+        assert!(lines[0].contains("\"cid\":1"));
+        assert!(lines[1].contains("\"cid\":2"));
+
+        let chunks =
+            read_to_string(config.state_dir.join("chunks.jsonl")).expect("read chunk index");
+        assert!(chunks.contains("part-000001.jsonl.zst"));
+
+        let mut state = StateStore::open(&config.state_dir, 4).expect("open state");
+        let chunk_index =
+            ChunkIndex::open(&config.state_dir.join("chunks.jsonl")).expect("open chunk index");
+        assert_eq!(
+            state
+                .rebuild_done_from_chunks(chunk_index.records())
+                .expect("rebuild done"),
+            2
+        );
+        assert_eq!(state.count_invalid(), 1);
+        assert_eq!(state.count_failed(), 1);
+
+        let failure_log =
+            read_to_string(config.log_dir.join("failures.log")).expect("read failure log");
+        assert!(failure_log.contains("\"cid\":4"));
+        assert!(failure_log.contains("\"attempt\":4"));
+        assert_eq!(server.requests().len(), 7);
+    }
+
+    #[test]
+    fn runtime_helpers_cover_counts_and_percent() {
+        let counts = RuntimeCounts {
+            total: 10,
+            successful: 3,
+            invalid: 2,
+            failed: 1,
+        };
+        assert_eq!(counts.processed(), 6);
+        assert_eq!(counts.pending(), 4);
+        assert_eq!(percent(0, 0), 100);
+        assert_eq!(percent(5, 10), 50);
+        assert!(has_labels(&ApiResponse {
+            class_results: vec!["lipid".to_string()],
+            superclass_results: Vec::new(),
+            pathway_results: Vec::new(),
+            isglycoside: false,
+        }));
+        assert!(!has_labels(&ApiResponse {
+            class_results: Vec::new(),
+            superclass_results: Vec::new(),
+            pathway_results: Vec::new(),
+            isglycoside: false,
+        }));
+        let config = RuntimeConfig::production();
+        assert_eq!(config.completed_dir, PathBuf::from(COMPLETED_DIR));
+        assert_eq!(config.state_dir, PathBuf::from(STATE_DIR));
+        assert_eq!(config.log_dir, PathBuf::from(LOG_DIR));
+        assert_eq!(config.release_dir, PathBuf::from(RELEASE_DIR));
+        assert_eq!(config.api_url, api::DEFAULT_API_URL);
+        assert!(config.ntfy_base.is_some());
+        assert!(config.install_ctrlc);
+    }
+
+    #[test]
+    fn classify_with_retry_returns_failed_after_retry_budget_exhausted() {
+        let server = MockHttpServer::spawn(vec![
+            MockResponse::empty("503 Service Unavailable"),
+            MockResponse::empty("503 Service Unavailable"),
+            MockResponse::empty("503 Service Unavailable"),
+            MockResponse::empty("503 Service Unavailable"),
+        ]);
+        let agent = ureq::AgentBuilder::new().build();
+        let shutdown = AtomicBool::new(false);
+        let mut ui = Ui::test_noninteractive();
+
+        let outcome = classify_with_retry(
+            &agent,
+            &server.url("/classify"),
+            &[Duration::from_millis(0); 3],
+            77,
+            "CCO",
+            &mut ui,
+            &shutdown,
+        );
+
+        match outcome {
+            RowOutcome::Failed {
+                attempt,
+                kind,
+                message,
+            } => {
+                assert_eq!(attempt, 4);
+                assert_eq!(kind, "server_error");
+                assert!(message.contains("HTTP 503"));
+            }
+            _ => panic!("expected failed outcome"),
+        }
+        assert_eq!(server.requests().len(), 4);
+    }
+
+    #[test]
+    fn classify_with_retry_returns_interrupted_when_shutdown_is_requested() {
+        let server = MockHttpServer::spawn(vec![MockResponse::empty("429 Too Many Requests")]);
+        let agent = ureq::AgentBuilder::new().build();
+        let shutdown = AtomicBool::new(true);
+        let mut ui = Ui::test_noninteractive();
+
+        let outcome = classify_with_retry(
+            &agent,
+            &server.url("/classify"),
+            &[
+                Duration::from_millis(1),
+                Duration::from_millis(0),
+                Duration::from_millis(0),
+            ],
+            88,
+            "CCO",
+            &mut ui,
+            &shutdown,
+        );
+
+        assert!(matches!(outcome, RowOutcome::Interrupted));
+    }
+
+    #[test]
+    fn run_with_config_returns_early_when_everything_is_already_terminal() {
+        let temp_dir = TestDir::new("run-noop");
+        let input_path = temp_dir.path().join("CID-SMILES.txt");
+        std::fs::write(&input_path, "1\tCCO\n").expect("write input");
+
+        let state_dir = temp_dir.path().join("state");
+        let completed_dir = temp_dir.path().join("completed");
+        let mut state = StateStore::open(&state_dir, 1).expect("open state");
+        let mut chunk_index =
+            ChunkIndex::open(&state_dir.join("chunks.jsonl")).expect("open index");
+        let mut writer =
+            ChunkWriter::new(&completed_dir, 1024, chunk_index.next_chunk_id()).expect("writer");
+        writer
+            .append(
+                0,
+                1,
+                "CCO",
+                ApiResponse {
+                    class_results: vec!["lipid".to_string()],
+                    superclass_results: Vec::new(),
+                    pathway_results: Vec::new(),
+                    isglycoside: false,
+                },
+            )
+            .expect("append");
+        let _ = writer
+            .seal_current(&mut state, &mut chunk_index)
+            .expect("seal")
+            .expect("chunk");
+
+        let args = Args {
+            input: input_path.to_string_lossy().into_owned(),
+        };
+        let config = RuntimeConfig {
+            completed_dir,
+            state_dir,
+            log_dir: temp_dir.path().join("logs"),
+            release_dir: temp_dir.path().join("releases"),
+            api_url: "http://127.0.0.1:9/classify".to_string(),
+            ntfy_base: None,
+            publish_interval: Duration::from_hours(168),
+            retry_delays: [Duration::from_millis(0); 3],
+            install_ctrlc: false,
+        };
+
+        run_with_config(&args, &config).expect("no-op run");
+    }
+
+    #[test]
+    fn notify_none_and_sleep_with_shutdown_cover_short_circuit_paths() {
+        let agent = ureq::AgentBuilder::new().build();
+        notify(&agent, None, "ignored");
+        notify(&agent, Some("http://127.0.0.1:9/ntfy"), "will fail locally");
+
+        let shutdown = AtomicBool::new(true);
+        assert!(sleep_with_shutdown(Duration::from_millis(1), &shutdown));
+    }
+
+    #[test]
+    fn notify_posts_successfully_and_sleep_returns_false_without_shutdown() {
+        let server = MockHttpServer::spawn(vec![MockResponse::empty("200 OK")]);
+        let agent = ureq::AgentBuilder::new().build();
+
+        notify(&agent, Some(&server.url("/ntfy")), "hello world");
+
+        let requests = server.requests();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].method, "POST");
+        assert_eq!(requests[0].path, "/ntfy");
+        assert_eq!(requests[0].body, b"hello world");
+
+        let shutdown = AtomicBool::new(false);
+        assert!(!sleep_with_shutdown(Duration::ZERO, &shutdown));
+    }
+
+    #[test]
+    fn run_wrapper_returns_early_for_empty_input() {
+        let _guard = env_lock();
+        let temp_dir = TestDir::new("run-wrapper");
+        let previous_dir = std::env::current_dir().expect("current dir");
+        let input_path = temp_dir.path().join("empty.txt");
+        std::fs::write(&input_path, "").expect("write empty input");
+
+        std::env::set_current_dir(temp_dir.path()).expect("enter temp dir");
+        let args = Args {
+            input: input_path.to_string_lossy().into_owned(),
+        };
+        let result = run(&args);
+        std::env::set_current_dir(previous_dir).expect("restore current dir");
+
+        result.expect("run wrapper");
+    }
+
+    #[test]
+    fn run_with_config_sends_notifications_and_checks_publish_interval() {
+        let _guard = env_lock();
+        let previous = std::env::var("ZENODO_TOKEN").ok();
+        unsafe {
+            std::env::remove_var("ZENODO_TOKEN");
+        }
+
+        let temp_dir = TestDir::new("run-ntfy");
+        let input_path = temp_dir.path().join("CID-SMILES.txt");
+        std::fs::write(&input_path, "1\tCCO\n").expect("write input");
+
+        let api_server = MockHttpServer::spawn(vec![MockResponse::json(
+            "200 OK",
+            r#"{"class_results":["lipid"],"superclass_results":[],"pathway_results":[],"isglycoside":false}"#,
+        )]);
+        let ntfy_server = MockHttpServer::spawn(vec![
+            MockResponse::empty("200 OK"),
+            MockResponse::empty("200 OK"),
+        ]);
+
+        let config = RuntimeConfig {
+            completed_dir: temp_dir.path().join("completed"),
+            state_dir: temp_dir.path().join("state"),
+            log_dir: temp_dir.path().join("logs"),
+            release_dir: temp_dir.path().join("releases"),
+            api_url: api_server.url("/classify"),
+            ntfy_base: Some(ntfy_server.url("/topic")),
+            publish_interval: Duration::ZERO,
+            retry_delays: [Duration::from_millis(0); 3],
+            install_ctrlc: false,
+        };
+        let args = Args {
+            input: input_path.to_string_lossy().into_owned(),
+        };
+
+        run_with_config(&args, &config).expect("run with notifications");
+
+        let requests = ntfy_server.requests();
+        assert_eq!(requests.len(), 2);
+        assert_eq!(requests[0].method, "POST");
+        assert!(String::from_utf8_lossy(&requests[0].body).contains("npc-labeler started"));
+        assert_eq!(requests[1].method, "POST");
+        assert!(String::from_utf8_lossy(&requests[1].body).contains("npc-labeler finished"));
+
+        if let Some(previous) = previous {
+            unsafe {
+                std::env::set_var("ZENODO_TOKEN", previous);
             }
         }
     }
 
-    db::wal_checkpoint(&mut conn);
+    #[test]
+    fn sync_runtime_state_seals_when_chunk_is_over_target_size() {
+        let temp_dir = TestDir::new("sync-runtime");
+        let state_dir = temp_dir.path().join("state");
+        let completed_dir = temp_dir.path().join("completed");
+        let mut state = StateStore::open(&state_dir, 2).expect("open state");
+        let mut chunk_index =
+            ChunkIndex::open(&state_dir.join("chunks.jsonl")).expect("open index");
+        let mut writer =
+            ChunkWriter::new(&completed_dir, 1, chunk_index.next_chunk_id()).expect("open writer");
 
-    let done = total - db::count_by_status(&mut conn, "pending");
-    notify(
-        &agent,
-        &ntfy_url,
-        &format!("npc-labeler finished: {done}/{total} done"),
-    );
+        writer
+            .append(
+                0,
+                1,
+                "CCO",
+                ApiResponse {
+                    class_results: vec!["lipid".to_string()],
+                    superclass_results: Vec::new(),
+                    pathway_results: Vec::new(),
+                    isglycoside: false,
+                },
+            )
+            .expect("append");
 
-    print_summary(&mut conn, total);
-}
+        sync_runtime_state(&mut writer, &mut state, &mut chunk_index).expect("sync runtime state");
+        assert_eq!(chunk_index.records().len(), 1);
+        assert!(completed_dir.join("part-000001.jsonl.zst").exists());
+    }
 
-fn print_summary(conn: &mut diesel::SqliteConnection, total: i64) {
-    let classified = db::count_by_status(conn, "classified");
-    let empty = db::count_by_status(conn, "empty");
-    let invalid = db::count_by_status(conn, "invalid");
-    let failed = db::count_by_status(conn, "failed");
-    let pending = db::count_by_status(conn, "pending");
+    #[test]
+    fn publish_to_zenodo_skips_when_token_is_missing() {
+        let _guard = env_lock();
+        let previous = std::env::var("ZENODO_TOKEN").ok();
+        unsafe {
+            std::env::remove_var("ZENODO_TOKEN");
+        }
 
-    println!("\n=== Summary ===");
-    println!("Total:      {total}");
-    println!("Classified: {classified}");
-    println!("Empty:      {empty}");
-    println!("Invalid:    {invalid}");
-    println!("Failed:     {failed}");
-    println!("Pending:    {pending}");
+        let temp_dir = TestDir::new("publish-skip");
+        let state_dir = temp_dir.path().join("state");
+        let completed_dir = temp_dir.path().join("completed");
+        let mut state = StateStore::open(&state_dir, 2).expect("open state");
+        let mut chunk_index =
+            ChunkIndex::open(&state_dir.join("chunks.jsonl")).expect("open index");
+        let mut writer = ChunkWriter::new(&completed_dir, 1024, chunk_index.next_chunk_id())
+            .expect("open writer");
+        let config = RuntimeConfig {
+            completed_dir,
+            state_dir,
+            log_dir: temp_dir.path().join("logs"),
+            release_dir: temp_dir.path().join("releases"),
+            api_url: "http://127.0.0.1:9/classify".to_string(),
+            ntfy_base: None,
+            publish_interval: Duration::from_hours(168),
+            retry_delays: [Duration::from_millis(0); 3],
+            install_ctrlc: false,
+        };
+        let counts = RuntimeCounts {
+            total: 1,
+            successful: 0,
+            invalid: 0,
+            failed: 0,
+        };
+        let agent = ureq::AgentBuilder::new().build();
+
+        publish_to_zenodo(
+            &mut writer,
+            &mut state,
+            &mut chunk_index,
+            counts,
+            &config,
+            &agent,
+            None,
+        )
+        .expect("publish skip");
+
+        if let Some(previous) = previous {
+            unsafe {
+                std::env::set_var("ZENODO_TOKEN", previous);
+            }
+        }
+    }
+
+    fn env_lock() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+            .lock()
+            .expect("lock env mutex")
+    }
 }
