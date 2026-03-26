@@ -1,87 +1,77 @@
 # NPC-Labeler
 
 [![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.14040990.svg)](https://doi.org/10.5281/zenodo.14040990)
+[![CI](https://github.com/earth-metabolome-initiative/npc-labeler/actions/workflows/ci.yml/badge.svg)](https://github.com/earth-metabolome-initiative/npc-labeler/actions/workflows/ci.yml)
 
-Utility to run the NPC APIs to classify SMILES, plus preprocessed datasets.
+A tool to build an open-source training dataset for natural product classification by scraping the [NPClassifier](https://npclassifier.gnps2.org/) API across all of PubChem.
 
-## Datasets
+NPClassifier classifies natural products into pathways, superclasses, and classes. The model is not open source: the authors host it as a web service but do not release the model weights or training data. This project queries the API for all ~123M PubChem SMILES and stores the results in a SQLite database, creating a fully open dataset that can be used to train an open-source replacement.
 
-Using this utility, we have already labelled SMILES from the following datasets which we share on Zenodo.
+*We do not recommend running this tool yourself. We are already running it and publishing updated snapshots of the dataset to [Zenodo](https://doi.org/10.5281/zenodo.14040990) on a weekly cadence. The code is shared for transparency and reproducibility. If you need the classification data, please use the Zenodo dataset rather than placing additional load on the NPClassifier API.*
 
-All GNPS MGF [are downloaded from the GNPS library](https://external.gnps2.org/gnpslibrary). The PubChem SMILES are downloaded from the [PubChem FTP](https://ftp.ncbi.nlm.nih.gov/pubchem/Compound/Extras/).
+## Dashboard
 
-| Dataset | JSON | CSV | Total SMILES | Partially classified SMILES |
-|---------|------|--------------------------------------------------------------------------------------------------------------------|--------------|-------------------|
-| GNPS    |          | 119031918    | 112486925         |
-| PubChem |                                                                                                                     | 106000000    | 106000000         |
+![CLI dashboard](cli.png)
+
+The tool provides a live terminal dashboard showing progress, current SMILES, request rate, database status, top classification categories, and recent events.
 
 ### Dataset format
 
-The datasets are stored in a gzip-ed JSON file with the following format:
+Results are stored in a SQLite database with the following schema:
 
-```json
-[
-    {
-        "class_results": [
-            "Cyclic peptides",
-            "Microcystins"
-        ],
-        "superclass_results": [
-            "Oligopeptides"
-        ],
-        "pathway_results": [
-            "Amino acids and Peptides"
-        ],
-        "isglycoside": false,
-        "smiles": "CC(C=CC1NC(=O)C(CCCN=C(N)N)NC(=O)C(C)C(C(=O)O)NC(=O)C(CC(C)C)=NC(=O)C(C)NC(=O)C(C)N(C)C(=O)CCC(C(=O)O)NC(=O)C1C)=CC(C)C(O)Cc1ccccc1"
-    },
-    {
-        "class_results": [
-            "Cyclic peptides",
-            "Depsipeptides"
-        ],
-        "superclass_results": [
-            "Oligopeptides"
-        ],
-        "pathway_results": [
-            "Amino acids and Peptides",
-            "Polyketides"
-        ],
-        "isglycoside": false,
-        "smiles": "CC(=O)OC1c2nc(cs2)C(=O)OC(CCCC(C)(Cl)[37Cl])C(C)C(=O)OC(C(C)(C)O)c2nc(cs2)C(=O)OC1(C)C"
-    }
-]
+```sql
+CREATE TABLE classifications (
+    cid INTEGER PRIMARY KEY NOT NULL,  -- PubChem Compound ID
+    smiles TEXT NOT NULL,              -- input SMILES
+    class_results TEXT,                -- JSON array of class labels
+    superclass_results TEXT,           -- JSON array of superclass labels
+    pathway_results TEXT,              -- JSON array of pathway labels
+    isglycoside BOOLEAN,
+    status TEXT NOT NULL,              -- pending/classified/empty/invalid/failed
+    attempts INTEGER NOT NULL,
+    last_error TEXT,
+    classified_at TIMESTAMP
+);
 ```
 
 ## Usage
 
-First, clone this repository:
+### Build
 
 ```bash
-git clone https://github.com/LucaCappelletti94/npc-labeler.git
+cargo build --release
 ```
 
-Navigate in it and install the requirements:
+### First run
+
+Download PubChem SMILES and start classifying:
 
 ```bash
-cd npc-labeler
-pip install -r requirements.txt
+curl -O https://ftp.ncbi.nlm.nih.gov/pubchem/Compound/Extras/CID-SMILES.gz
+./target/release/npc-labeler --input CID-SMILES.gz
 ```
 
-Then, you can run the labeler by providing the input file and the output file:
+This loads all SMILES into a SQLite database (`classifications.sqlite`) and begins classifying them one by one through the NPClassifier API.
+
+### Resume after interruption
+
+Re-run without `--input` to resume from where it left off:
 
 ```bash
-python3 labeler.py --input <input_file> --output <output_file>
+./target/release/npc-labeler
 ```
 
-For instance, suppose you want to classify the SMILES in the metadata of an MGF document and store it into a `classified_matchms.json.gz` file. You can do it by running:
+### Push notifications
 
-```bash
-python3 labeler.py --input matchms.mgf --output classified_matchms.json.gz
+On startup, the tool generates a unique [ntfy](https://ntfy.sh) topic and prints the subscribe URL. Open it on your phone or browser to receive a notification at every 1% completion milestone, plus start and finish messages.
+
+### Options
+
+```text
+--input <file>   Path to CID-SMILES input file (.gz or plain). Omit to resume.
+--db <file>      Path to SQLite database (default: classifications.sqlite)
 ```
 
-Similarly, for a SSV file:
+## License
 
-```bash
-python3 labeler.py --input CID-SMILES.ssv --output pubchem.json.gz
-```
+See [LICENSE](LICENSE).
