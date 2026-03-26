@@ -15,6 +15,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use chrono::{DateTime, NaiveDate, Timelike, Utc};
 use clap::Parser;
 use flate2::read::GzDecoder;
 
@@ -34,6 +35,7 @@ const RETRY_DELAYS: [Duration; 3] = [
     Duration::from_secs(5),
     Duration::from_secs(15),
 ];
+const DAILY_STATUS_HOUR_UTC: u32 = 18;
 const STATE_DIR: &str = "state";
 const STATE_SYNC_INTERVAL: Duration = Duration::from_secs(5);
 const STATE_SYNC_ROWS: u64 = 1_000;
@@ -185,6 +187,7 @@ fn run_with_config(args: &Args, config: &RuntimeConfig) -> io::Result<()> {
     let mut last_publish = Instant::now();
     let mut last_state_sync = Instant::now();
     let mut last_notified_pct = percent(counts.processed(), counts.total);
+    let mut last_daily_status_date = None;
     let mut terminal_updates_since_sync = 0_u64;
     let mut line_index: LineIndex = 0;
 
@@ -269,6 +272,13 @@ fn run_with_config(args: &Args, config: &RuntimeConfig) -> io::Result<()> {
             terminal_updates_since_sync = 0;
             last_state_sync = Instant::now();
         }
+
+        maybe_notify_daily_status(
+            &agent,
+            ntfy_url.as_deref(),
+            counts,
+            &mut last_daily_status_date,
+        );
 
         if last_dashboard.elapsed() >= DASHBOARD_INTERVAL {
             ui.render();
@@ -433,6 +443,47 @@ fn print_summary(counts: RuntimeCounts) {
     println!("Pending:    {}", counts.pending());
 }
 
+fn should_send_daily_status(now_utc: DateTime<Utc>, last_sent_date: Option<NaiveDate>) -> bool {
+    now_utc.hour() >= DAILY_STATUS_HOUR_UTC && Some(now_utc.date_naive()) != last_sent_date
+}
+
+fn daily_status_message(counts: RuntimeCounts) -> String {
+    format!(
+        "18:00 UTC status: handled {}/{} samples | failures={} | successful={} | invalid={} | pending={}",
+        counts.processed(),
+        counts.total,
+        counts.failed,
+        counts.successful,
+        counts.invalid,
+        counts.pending()
+    )
+}
+
+fn maybe_notify_daily_status(
+    agent: &ureq::Agent,
+    ntfy_url: Option<&str>,
+    counts: RuntimeCounts,
+    last_sent_date: &mut Option<NaiveDate>,
+) {
+    let now_utc = Utc::now();
+    if !should_send_daily_status(now_utc, *last_sent_date) {
+        return;
+    }
+    notify(agent, ntfy_url, &daily_status_message(counts));
+    *last_sent_date = Some(now_utc.date_naive());
+}
+
+fn zenodo_release_complete_message(doi: &str, counts: RuntimeCounts) -> String {
+    format!(
+        "Zenodo release complete: {doi} | handled {}/{} samples | failures={} | successful={} | invalid={}",
+        counts.processed(),
+        counts.total,
+        counts.failed,
+        counts.successful,
+        counts.invalid
+    )
+}
+
 fn publish_to_zenodo(
     writer: &mut ChunkWriter,
     state: &mut StateStore,
@@ -476,6 +527,11 @@ fn publish_to_zenodo(
                 ntfy_url,
                 &format!("Published to Zenodo: {doi} ({} rows)", counts.successful),
             );
+            notify(
+                agent,
+                ntfy_url,
+                &zenodo_release_complete_message(&doi, counts),
+            );
             std::fs::remove_file(&release.output_path)?;
             std::fs::remove_file(&release.manifest_path)?;
         }
@@ -517,6 +573,7 @@ fn sync_runtime_state(
 mod tests {
     use super::*;
     use crate::test_support::{MockHttpServer, MockResponse, TestDir};
+    use chrono::TimeZone;
     use flate2::Compression;
     use flate2::write::GzEncoder;
     use std::fs::read_to_string;
@@ -659,6 +716,40 @@ mod tests {
         assert_eq!(config.api_url, api::DEFAULT_API_URL);
         assert!(config.ntfy_base.is_some());
         assert!(config.install_ctrlc);
+    }
+
+    #[test]
+    fn daily_status_and_zenodo_messages_include_expected_state() {
+        let counts = RuntimeCounts {
+            total: 10,
+            successful: 3,
+            invalid: 2,
+            failed: 1,
+        };
+        let before_cutoff = Utc.with_ymd_and_hms(2026, 3, 26, 17, 59, 59).unwrap();
+        let after_cutoff = Utc.with_ymd_and_hms(2026, 3, 26, 18, 0, 0).unwrap();
+        let next_day = Utc.with_ymd_and_hms(2026, 3, 27, 18, 0, 0).unwrap();
+
+        assert!(!should_send_daily_status(before_cutoff, None));
+        assert!(should_send_daily_status(after_cutoff, None));
+        assert!(!should_send_daily_status(
+            after_cutoff,
+            Some(after_cutoff.date_naive())
+        ));
+        assert!(should_send_daily_status(
+            next_day,
+            Some(after_cutoff.date_naive())
+        ));
+
+        let daily_status = daily_status_message(counts);
+        assert!(daily_status.contains("handled 6/10 samples"));
+        assert!(daily_status.contains("failures=1"));
+        assert!(daily_status.contains("pending=4"));
+
+        let zenodo_message = zenodo_release_complete_message("10.1234/mock", counts);
+        assert!(zenodo_message.contains("Zenodo release complete: 10.1234/mock"));
+        assert!(zenodo_message.contains("handled 6/10 samples"));
+        assert!(zenodo_message.contains("successful=3"));
     }
 
     #[test]
@@ -835,6 +926,7 @@ mod tests {
         let ntfy_server = MockHttpServer::spawn(vec![
             MockResponse::empty("200 OK"),
             MockResponse::empty("200 OK"),
+            MockResponse::empty("200 OK"),
         ]);
 
         let config = RuntimeConfig {
@@ -855,11 +947,22 @@ mod tests {
         run_with_config(&args, &config).expect("run with notifications");
 
         let requests = ntfy_server.requests();
-        assert_eq!(requests.len(), 2);
-        assert_eq!(requests[0].method, "POST");
-        assert!(String::from_utf8_lossy(&requests[0].body).contains("npc-labeler started"));
-        assert_eq!(requests[1].method, "POST");
-        assert!(String::from_utf8_lossy(&requests[1].body).contains("npc-labeler finished"));
+        assert!(requests.len() >= 2);
+        let bodies: Vec<_> = requests
+            .iter()
+            .map(|request| String::from_utf8_lossy(&request.body).into_owned())
+            .collect();
+        assert!(requests.iter().all(|request| request.method == "POST"));
+        assert!(
+            bodies
+                .iter()
+                .any(|body| body.contains("npc-labeler started"))
+        );
+        assert!(
+            bodies
+                .iter()
+                .any(|body| body.contains("npc-labeler finished"))
+        );
 
         if let Some(previous) = previous {
             unsafe {
