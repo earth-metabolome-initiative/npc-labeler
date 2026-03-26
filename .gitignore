@@ -174,3 +174,9 @@ ALL_GNPS_NO_PROPOGATED.mgf
 *.mgf
 *.json.gz
 *.tar.gz
+*.gz
+*.sqlite
+*.sqlite-shm
+*.sqlite-wal
+target/
+CID-SMILES.gz

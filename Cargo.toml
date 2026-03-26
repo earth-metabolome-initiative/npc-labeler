@@ -1,0 +1,46 @@
+[package]
+name = "npc-labeler"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+clap = { version = "4", features = ["derive"] }
+diesel = { version = "2", features = ["sqlite", "chrono"] }
+diesel_migrations = "2"
+ureq = { version = "2", features = ["json"] }
+crossterm = "0.29"
+ctrlc = "3"
+flate2 = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+chrono = "0.4"
+uuid = { version = "1", features = ["v4"] }
+arrow = { version = "55", default-features = false }
+parquet = { version = "55", default-features = false, features = ["arrow", "snap", "zstd"] }
+dotenvy = "0.15"
+
+[lints.clippy]
+pedantic = { level = "warn", priority = -1 }
+dbg_macro = "warn"
+todo = "warn"
+uninlined_format_args = "warn"
+redundant_clone = "warn"
+cast_lossless = "warn"
+manual_string_new = "warn"
+needless_pass_by_value = "warn"
+semicolon_if_nothing_returned = "warn"
+trivially_copy_pass_by_ref = "warn"
+# Allow these pedantic lints that are too noisy
+module_name_repetitions = "allow"
+missing_errors_doc = "allow"
+missing_panics_doc = "allow"
+must_use_candidate = "allow"
+cast_possible_truncation = "allow"
+cast_sign_loss = "allow"
+cast_precision_loss = "allow"
+cast_possible_wrap = "allow"
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true

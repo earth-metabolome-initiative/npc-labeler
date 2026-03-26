@@ -1,7 +1,0 @@
-rdkit
-tqdm
-requests
-compress_json
-matchms
-cache_decorator
-fake-useragent
