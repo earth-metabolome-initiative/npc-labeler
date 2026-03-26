@@ -10,13 +10,7 @@ NPClassifier classifies natural products into pathways, superclasses, and classe
 > [!IMPORTANT]
 > *We do not recommend running this tool yourself. We are already running it and publishing updated snapshots of the dataset to [Zenodo](https://doi.org/10.5281/zenodo.14040990) on a weekly cadence. The code is shared for transparency and reproducibility. If you need the classification data, please use the Zenodo dataset rather than placing additional load on the NPClassifier API.*
 
-## Dashboard
-
-![CLI dashboard](cli.png)
-
-The tool provides a minimal live terminal view showing the current CID/SMILES, request rate, and last result.
-
-### Dataset format
+## Dataset format
 
 Successful responses are written directly to sealed `jsonl.zst` chunks under `completed/`, then merged into a staged `completed.jsonl.zst` release artifact when publishing.
 
