@@ -14,9 +14,11 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 chrono = "0.4"
 sha2 = "0.10"
+tokio = { version = "1", features = ["rt-multi-thread"] }
 uuid = { version = "1", features = ["v4"] }
 dotenvy = "0.15"
 zstd = "0.13"
+zenodo-rs = "0.1"
 
 [lints.clippy]
 pedantic = { level = "warn", priority = -1 }
