@@ -12,6 +12,9 @@ pub struct StateStore {
     done: MmapBitVec,
     invalid: MmapBitVec,
     failed: MmapBitVec,
+    done_dirty: bool,
+    invalid_dirty: bool,
+    failed_dirty: bool,
 }
 
 impl StateStore {
@@ -25,6 +28,9 @@ impl StateStore {
             done,
             invalid,
             failed,
+            done_dirty: false,
+            invalid_dirty: false,
+            failed_dirty: false,
         })
     }
 
@@ -39,35 +45,54 @@ impl StateStore {
             }
         }
         self.done.flush()?;
+        self.done_dirty = false;
         Ok(self.done.count_ones())
     }
 
+    #[inline]
     pub fn is_terminal(&self, line: LineIndex) -> bool {
         let index = line as usize;
         self.done.get(index) || self.invalid.get(index) || self.failed.get(index)
     }
 
+    #[inline]
     pub fn mark_invalid(&mut self, line: LineIndex) {
         self.invalid.set(line as usize);
+        self.invalid_dirty = true;
     }
 
+    #[inline]
     pub fn mark_failed(&mut self, line: LineIndex) {
         self.failed.set(line as usize);
+        self.failed_dirty = true;
     }
 
+    #[inline]
     pub fn mark_done_batch(&mut self, lines: &[LineIndex]) {
         for &line in lines {
             self.done.set(line as usize);
         }
+        self.done_dirty |= !lines.is_empty();
     }
 
     pub fn sync_terminal(&mut self) -> io::Result<()> {
-        self.invalid.flush()?;
-        self.failed.flush()
+        if self.invalid_dirty {
+            self.invalid.flush()?;
+            self.invalid_dirty = false;
+        }
+        if self.failed_dirty {
+            self.failed.flush()?;
+            self.failed_dirty = false;
+        }
+        Ok(())
     }
 
     pub fn sync_done(&mut self) -> io::Result<()> {
-        self.done.flush()
+        if self.done_dirty {
+            self.done.flush()?;
+            self.done_dirty = false;
+        }
+        Ok(())
     }
 
     pub fn count_invalid(&self) -> u64 {
@@ -133,12 +158,14 @@ impl MmapBitVec {
             .sum()
     }
 
+    #[inline]
     fn get(&self, index: usize) -> bool {
         let byte = index / 8;
         let mask = 1_u8 << (index % 8);
         self.map[byte] & mask != 0
     }
 
+    #[inline]
     fn set(&mut self, index: usize) {
         let byte = index / 8;
         let mask = 1_u8 << (index % 8);

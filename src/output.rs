@@ -195,7 +195,13 @@ impl ChunkWriter {
         if self.row_count == 0 {
             return Ok(false);
         }
-        Ok(self.sync_active()? >= self.target_bytes)
+        let active_size = self.sync_active()?;
+        Ok(self.should_rotate_for_size(active_size))
+    }
+
+    #[inline]
+    pub fn should_rotate_for_size(&self, active_size: u64) -> bool {
+        self.row_count > 0 && active_size >= self.target_bytes
     }
 
     pub fn seal_current(

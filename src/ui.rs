@@ -61,11 +61,13 @@ impl Ui {
 
     pub fn note_current(&mut self, cid: i32, smiles: &str) {
         self.current_cid = Some(cid);
-        self.current_smiles = Some(if smiles.len() > 60 {
-            format!("{}...", &smiles[..57])
-        } else {
-            smiles.to_string()
-        });
+        if self.interactive {
+            self.current_smiles = Some(if smiles.len() > 60 {
+                format!("{}...", &smiles[..57])
+            } else {
+                smiles.to_string()
+            });
+        }
         self.session_requests += 1;
     }
 
@@ -220,7 +222,7 @@ mod tests {
     #[test]
     fn note_current_truncates_long_smiles_and_updates_result_fields() {
         let mut ui = Ui {
-            interactive: false,
+            interactive: true,
             ntfy_url: None,
             started_at: Instant::now(),
             current_smiles: None,

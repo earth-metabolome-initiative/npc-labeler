@@ -29,6 +29,7 @@ pub enum ClassifyError {
 }
 
 impl ClassifyError {
+    #[inline]
     pub fn kind(&self) -> &'static str {
         match self {
             Self::InvalidSmiles => "invalid_smiles",
@@ -56,10 +57,12 @@ impl fmt::Display for ClassifyError {
     }
 }
 
+#[inline]
 pub fn classify(agent: &ureq::Agent, smiles: &str) -> Result<ApiResponse, ClassifyError> {
     classify_at(agent, API_URL, smiles)
 }
 
+#[inline]
 pub(crate) fn classify_at(
     agent: &ureq::Agent,
     api_url: &str,

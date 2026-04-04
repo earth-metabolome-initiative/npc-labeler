@@ -91,10 +91,12 @@ struct RuntimeCounts {
 }
 
 impl RuntimeCounts {
+    #[inline]
     fn processed(self) -> u64 {
         self.successful + self.invalid + self.failed
     }
 
+    #[inline]
     fn pending(self) -> u64 {
         self.total.saturating_sub(self.processed())
     }
@@ -193,9 +195,16 @@ fn run_with_config(args: &Args, config: &RuntimeConfig) -> io::Result<()> {
     let mut last_daily_status_date = None;
     let mut terminal_updates_since_sync = 0_u64;
     let mut line_index: LineIndex = 0;
+    let use_default_api = config.api_url == api::DEFAULT_API_URL;
 
-    let reader = open_input_reader(input_path)?;
-    for line_result in reader.lines() {
+    let mut reader = open_input_reader(input_path)?;
+    let mut line = String::new();
+    loop {
+        line.clear();
+        if reader.read_line(&mut line)? == 0 {
+            break;
+        }
+
         if shutdown.load(Ordering::Relaxed) {
             break;
         }
@@ -214,7 +223,6 @@ fn run_with_config(args: &Args, config: &RuntimeConfig) -> io::Result<()> {
             last_publish = Instant::now();
         }
 
-        let line = line_result?;
         let Some((cid, smiles)) = parse_input_line(&line) else {
             continue;
         };
@@ -232,15 +240,16 @@ fn run_with_config(args: &Args, config: &RuntimeConfig) -> io::Result<()> {
         match classify_with_retry(
             &agent,
             &config.api_url,
+            use_default_api,
             &config.retry_delays,
             cid,
-            &smiles,
+            smiles,
             &mut ui,
             &shutdown,
         ) {
             RowOutcome::Success(response) => {
                 let has_labels = has_labels(&response);
-                writer.append(current_line, cid, &smiles, response)?;
+                writer.append(current_line, cid, smiles, response)?;
                 counts.successful += 1;
                 terminal_updates_since_sync += 1;
                 if has_labels {
@@ -261,7 +270,7 @@ fn run_with_config(args: &Args, config: &RuntimeConfig) -> io::Result<()> {
                 message,
             } => {
                 state.mark_failed(current_line);
-                failure_log.log(current_line, cid, &smiles, &kind, &message, attempt)?;
+                failure_log.log(current_line, cid, smiles, &kind, &message, attempt)?;
                 counts.failed += 1;
                 terminal_updates_since_sync += 1;
                 ui.note_error(cid, &message);
@@ -327,6 +336,7 @@ fn run_with_config(args: &Args, config: &RuntimeConfig) -> io::Result<()> {
 fn classify_with_retry(
     agent: &ureq::Agent,
     api_url: &str,
+    use_default_api: bool,
     retry_delays: &[Duration; 3],
     cid: i32,
     smiles: &str,
@@ -335,7 +345,7 @@ fn classify_with_retry(
 ) -> RowOutcome {
     let mut attempt = 1_u8;
     loop {
-        let result = if api_url == api::DEFAULT_API_URL {
+        let result = if use_default_api {
             api::classify(agent, smiles)
         } else {
             api::classify_at(agent, api_url, smiles)
@@ -344,20 +354,18 @@ fn classify_with_retry(
             Ok(response) => return RowOutcome::Success(response),
             Err(ClassifyError::InvalidSmiles) => return RowOutcome::Invalid,
             Err(error) => {
-                let kind = error.kind().to_string();
-                let message = error.message();
                 let Some(delay) = retry_delays.get((attempt - 1) as usize) else {
                     return RowOutcome::Failed {
                         attempt,
-                        kind,
-                        message,
+                        kind: error.kind().to_string(),
+                        message: error.message(),
                     };
                 };
 
-                if matches!(error, ClassifyError::RateLimit) {
+                if matches!(&error, ClassifyError::RateLimit) {
                     ui.note_rate_limit(cid);
                 } else {
-                    ui.note_error(cid, &format!("{message}; retrying in {}s", delay.as_secs()));
+                    ui.note_error(cid, &format!("{error}; retrying in {}s", delay.as_secs()));
                 }
 
                 if sleep_with_shutdown(*delay, shutdown) {
@@ -369,11 +377,17 @@ fn classify_with_retry(
     }
 }
 
+#[inline]
 fn count_input_rows(path: &Path) -> io::Result<LineIndex> {
     let mut total = 0_u32;
-    let reader = open_input_reader(path)?;
-    for line_result in reader.lines() {
-        let line = line_result?;
+    let mut reader = open_input_reader(path)?;
+    let mut line = String::new();
+    loop {
+        line.clear();
+        if reader.read_line(&mut line)? == 0 {
+            break;
+        }
+
         if parse_input_line(&line).is_some() {
             total = total
                 .checked_add(1)
@@ -383,6 +397,7 @@ fn count_input_rows(path: &Path) -> io::Result<LineIndex> {
     Ok(total)
 }
 
+#[inline]
 fn has_labels(response: &ApiResponse) -> bool {
     !response.class_results.is_empty()
         || !response.superclass_results.is_empty()
@@ -425,12 +440,14 @@ fn open_input_reader(path: &Path) -> io::Result<Box<dyn BufRead>> {
     Ok(Box::new(BufReader::with_capacity(8 * 1024 * 1024, file)))
 }
 
-fn parse_input_line(line: &str) -> Option<(i32, String)> {
+#[inline]
+fn parse_input_line(line: &str) -> Option<(i32, &str)> {
     let (cid, smiles) = line.split_once('\t')?;
     let cid = cid.parse::<i32>().ok()?;
-    Some((cid, smiles.trim().to_string()))
+    Some((cid, smiles.trim()))
 }
 
+#[inline]
 fn percent(done: u64, total: u64) -> u64 {
     if total == 0 {
         return 100;
@@ -574,9 +591,9 @@ fn sync_runtime_state(
     state: &mut StateStore,
     chunk_index: &mut ChunkIndex,
 ) -> io::Result<()> {
-    let _ = writer.sync_active()?;
+    let active_size = writer.sync_active()?;
     state.sync_terminal()?;
-    if writer.should_rotate()? {
+    if writer.should_rotate_for_size(active_size) {
         let _ = writer.seal_current(state, chunk_index)?;
     }
     Ok(())
@@ -596,7 +613,7 @@ mod tests {
 
     #[test]
     fn parse_input_line_rejects_invalid_rows() {
-        assert_eq!(parse_input_line("123\tCCO"), Some((123, "CCO".to_string())));
+        assert_eq!(parse_input_line("123\tCCO"), Some((123, "CCO")));
         assert_eq!(parse_input_line("nope\tCCO"), None);
         assert_eq!(parse_input_line("123"), None);
     }
@@ -817,6 +834,7 @@ mod tests {
         let outcome = classify_with_retry(
             &agent,
             &server.url("/classify"),
+            false,
             &[Duration::from_millis(0); 3],
             77,
             "CCO",
@@ -849,6 +867,7 @@ mod tests {
         let outcome = classify_with_retry(
             &agent,
             &server.url("/classify"),
+            false,
             &[
                 Duration::from_millis(1),
                 Duration::from_millis(0),
