@@ -113,6 +113,14 @@ enum RowOutcome {
     Interrupted,
 }
 
+struct RetryContext<'a> {
+    agent: &'a ureq::Agent,
+    api_url: &'a str,
+    use_default_api: bool,
+    retry_delays: &'a [Duration; 3],
+    shutdown: &'a AtomicBool,
+}
+
 fn main() {
     dotenvy::dotenv().ok();
 
@@ -236,16 +244,18 @@ fn run_with_config(args: &Args, config: &RuntimeConfig) -> io::Result<()> {
             continue;
         }
 
-        ui.note_current(cid, &smiles);
+        ui.note_current(cid, smiles);
         match classify_with_retry(
-            &agent,
-            &config.api_url,
-            use_default_api,
-            &config.retry_delays,
+            &RetryContext {
+                agent: &agent,
+                api_url: &config.api_url,
+                use_default_api,
+                retry_delays: &config.retry_delays,
+                shutdown: &shutdown,
+            },
             cid,
             smiles,
             &mut ui,
-            &shutdown,
         ) {
             RowOutcome::Success(response) => {
                 let has_labels = has_labels(&response);
@@ -334,27 +344,23 @@ fn run_with_config(args: &Args, config: &RuntimeConfig) -> io::Result<()> {
 }
 
 fn classify_with_retry(
-    agent: &ureq::Agent,
-    api_url: &str,
-    use_default_api: bool,
-    retry_delays: &[Duration; 3],
+    context: &RetryContext<'_>,
     cid: i32,
     smiles: &str,
     ui: &mut Ui,
-    shutdown: &AtomicBool,
 ) -> RowOutcome {
     let mut attempt = 1_u8;
     loop {
-        let result = if use_default_api {
-            api::classify(agent, smiles)
+        let result = if context.use_default_api {
+            api::classify(context.agent, smiles)
         } else {
-            api::classify_at(agent, api_url, smiles)
+            api::classify_at(context.agent, context.api_url, smiles)
         };
         match result {
             Ok(response) => return RowOutcome::Success(response),
             Err(ClassifyError::InvalidSmiles) => return RowOutcome::Invalid,
             Err(error) => {
-                let Some(delay) = retry_delays.get((attempt - 1) as usize) else {
+                let Some(delay) = context.retry_delays.get((attempt - 1) as usize) else {
                     return RowOutcome::Failed {
                         attempt,
                         kind: error.kind().to_string(),
@@ -368,7 +374,7 @@ fn classify_with_retry(
                     ui.note_error(cid, &format!("{error}; retrying in {}s", delay.as_secs()));
                 }
 
-                if sleep_with_shutdown(*delay, shutdown) {
+                if sleep_with_shutdown(*delay, context.shutdown) {
                     return RowOutcome::Interrupted;
                 }
                 attempt += 1;
@@ -832,14 +838,16 @@ mod tests {
         let mut ui = Ui::test_noninteractive();
 
         let outcome = classify_with_retry(
-            &agent,
-            &server.url("/classify"),
-            false,
-            &[Duration::from_millis(0); 3],
+            &RetryContext {
+                agent: &agent,
+                api_url: &server.url("/classify"),
+                use_default_api: false,
+                retry_delays: &[Duration::from_millis(0); 3],
+                shutdown: &shutdown,
+            },
             77,
             "CCO",
             &mut ui,
-            &shutdown,
         );
 
         match outcome {
@@ -865,18 +873,20 @@ mod tests {
         let mut ui = Ui::test_noninteractive();
 
         let outcome = classify_with_retry(
-            &agent,
-            &server.url("/classify"),
-            false,
-            &[
-                Duration::from_millis(1),
-                Duration::from_millis(0),
-                Duration::from_millis(0),
-            ],
+            &RetryContext {
+                agent: &agent,
+                api_url: &server.url("/classify"),
+                use_default_api: false,
+                retry_delays: &[
+                    Duration::from_millis(1),
+                    Duration::from_millis(0),
+                    Duration::from_millis(0),
+                ],
+                shutdown: &shutdown,
+            },
             88,
             "CCO",
             &mut ui,
-            &shutdown,
         );
 
         assert!(matches!(outcome, RowOutcome::Interrupted));

@@ -1,6 +1,7 @@
 #![cfg(test)]
 
 use std::collections::VecDeque;
+use std::fmt::Write as _;
 use std::fs::{create_dir_all, remove_dir_all};
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
@@ -48,7 +49,7 @@ impl MockResponse {
             self.body.len()
         );
         for (name, value) in self.headers {
-            response.push_str(&format!("{name}: {value}\r\n"));
+            let _ = write!(response, "{name}: {value}\r\n");
         }
         response.push_str("\r\n");
         stream

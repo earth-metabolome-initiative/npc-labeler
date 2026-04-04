@@ -259,9 +259,8 @@ mod tests {
         file.set_len(64).expect("seed wrong size");
         drop(file);
 
-        let error = match MmapBitVec::open(&path, 8, false) {
-            Ok(_) => panic!("expected size mismatch"),
-            Err(error) => error,
+        let Err(error) = MmapBitVec::open(&path, 8, false) else {
+            panic!("expected size mismatch");
         };
         assert!(error.to_string().contains("expected 1"));
     }

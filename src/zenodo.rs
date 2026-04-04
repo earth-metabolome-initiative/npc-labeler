@@ -112,7 +112,7 @@ fn zenodo_client(token: &str, config: &PublishConfig) -> Result<ZenodoClient, St
             env!("CARGO_PKG_VERSION")
         ))
         .poll_options(PollOptions {
-            max_wait: Duration::from_secs(120),
+            max_wait: Duration::from_mins(2),
             initial_delay: Duration::from_millis(250),
             max_delay: Duration::from_secs(2),
         })

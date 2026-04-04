@@ -191,14 +191,6 @@ impl ChunkWriter {
         writer.get_ref().metadata().map(|metadata| metadata.len())
     }
 
-    pub fn should_rotate(&mut self) -> io::Result<bool> {
-        if self.row_count == 0 {
-            return Ok(false);
-        }
-        let active_size = self.sync_active()?;
-        Ok(self.should_rotate_for_size(active_size))
-    }
-
     #[inline]
     pub fn should_rotate_for_size(&self, active_size: u64) -> bool {
         self.row_count > 0 && active_size >= self.target_bytes
@@ -527,7 +519,7 @@ mod tests {
             ChunkWriter::new(&completed_dir, 1024, chunk_index.next_chunk_id()).expect("writer");
 
         assert_eq!(writer.sync_active().expect("sync active"), 0);
-        assert!(!writer.should_rotate().expect("should rotate"));
+        assert!(!writer.should_rotate_for_size(0));
         assert!(
             writer
                 .seal_current(&mut state, &mut chunk_index)
