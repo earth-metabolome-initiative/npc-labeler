@@ -2,7 +2,7 @@
 
 [![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.14040990.svg)](https://doi.org/10.5281/zenodo.14040990)
 [![CI](https://github.com/earth-metabolome-initiative/npc-labeler/actions/workflows/ci.yml/badge.svg)](https://github.com/earth-metabolome-initiative/npc-labeler/actions/workflows/ci.yml)
-![crawl status](https://img.shields.io/badge/crawl_status-2%2C830%2C000%2F123%2C500%2C000_labeled_%7C_258.0%2Fmin_%7C_ETA_~2027--02--21-blue)
+![crawl status](https://img.shields.io/badge/crawl_status-5%2C480%2C150%2F123%2C500%2C000_labeled_%7C_234.1%2Fmin_%7C_ETA_~2027--03--27-blue)
 
 NPC-Labeler builds an open dataset for natural product classification by querying the [NPClassifier](https://npclassifier.gnps2.org/) API across PubChem SMILES and writing successful results to compressed JSONL chunks.
 
