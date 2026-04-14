@@ -9,6 +9,8 @@ NPC-Labeler builds an open dataset for natural product classification by queryin
 > [!IMPORTANT]
 > We do not recommend running this yourself. An ongoing crawl is already publishing weekly snapshots to [Zenodo](https://doi.org/10.5281/zenodo.14040990). If you need the data, use the Zenodo release instead of adding load to the NPClassifier API.
 
+![Current progress dashboard](zenodo-progress.png)
+
 ## Quick Start and then wait for a year
 
 ```bash
@@ -24,6 +26,8 @@ Successful classifications are written to `completed/` as chunked `jsonl.zst` fi
 On startup, the tool also prints an [ntfy](https://ntfy.sh) subscribe URL for progress notifications.
 
 ## Progress Dashboard
+
+The checked-in dashboard image above is refreshed automatically each week from the latest published Zenodo snapshot.
 
 Render a single dashboard summarizing crawl coverage, terminal outcomes, and the top labels at each NPClassifier taxonomy layer:
 

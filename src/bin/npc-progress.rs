@@ -1,7 +1,9 @@
 use std::collections::HashMap;
+use std::f64::consts::{FRAC_PI_2, TAU};
 use std::fs::{self, File};
 use std::io::{self, BufRead, BufReader};
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 use std::time::Duration;
 
 use chrono::Utc;
@@ -9,6 +11,7 @@ use clap::Parser;
 use flate2::read::GzDecoder;
 use plotters::coord::Shift;
 use plotters::prelude::*;
+use plotters::style::{FontStyle, register_font};
 use serde::Deserialize;
 use zenodo_rs::{ArtifactSelector, Auth, ZenodoClient};
 use zstd::stream::read::Decoder as ZstdDecoder;
@@ -17,6 +20,7 @@ const DEFAULT_ZENODO_DOI: &str = "10.5281/zenodo.14040990";
 const WIDTH: u32 = 1_600;
 const HEADER_HEIGHT: u32 = 108;
 const METRICS_ROW_HEIGHT: u32 = 292;
+const CIRCLE_CENTER_Y_OFFSET: i32 = 24;
 
 const BG: RGBColor = RGBColor(255, 255, 255);
 const PANEL_BG: RGBColor = RGBColor(255, 255, 255);
@@ -26,12 +30,19 @@ const MUTED: RGBColor = RGBColor(107, 117, 128);
 const COVERAGE_COLOR: RGBColor = RGBColor(35, 137, 142);
 const REMAINING_COLOR: RGBColor = RGBColor(206, 213, 221);
 const SUCCESS_COLOR: RGBColor = RGBColor(54, 136, 88);
+const EMPTY_COLOR: RGBColor = RGBColor(130, 184, 142);
 const INVALID_COLOR: RGBColor = RGBColor(223, 170, 72);
 const FAILED_COLOR: RGBColor = RGBColor(200, 93, 73);
 const UNSUCCESSFUL_COLOR: RGBColor = RGBColor(200, 93, 73);
 const PATHWAY_COLOR: RGBColor = RGBColor(59, 143, 168);
 const SUPERCLASS_COLOR: RGBColor = RGBColor(218, 149, 58);
 const CLASS_COLOR: RGBColor = RGBColor(178, 88, 71);
+const FONT_ENV: &str = "NPC_LABELER_FONT_PATH";
+const FONT_CANDIDATES: &[&str] = &[
+    "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+    "/usr/share/fonts/dejavu/DejaVuSans.ttf",
+    "/usr/share/fonts/TTF/DejaVuSans.ttf",
+];
 
 #[derive(Parser, Debug)]
 #[command(name = "npc-progress")]
@@ -119,11 +130,53 @@ struct MetricPanel {
 }
 
 #[derive(Debug, Clone)]
+struct OverlayTextLine {
+    text: String,
+    center_x: i32,
+    y: i32,
+    font_size: f64,
+    color: RGBColor,
+}
+
+#[derive(Debug, Clone)]
+struct MetricOverlay {
+    center: (i32, i32),
+    outer_radius: f64,
+    inner_radius: f64,
+    slices: Vec<MetricSlice>,
+    text_lines: Vec<OverlayTextLine>,
+}
+
+#[derive(Debug, Clone)]
+struct RingOverlay {
+    outer_radius: f64,
+    inner_radius: f64,
+    value: u64,
+    total: u64,
+    color: RGBColor,
+    background: RGBColor,
+}
+
+#[derive(Debug, Clone)]
+struct DepthOverlay {
+    center: (i32, i32),
+    rings: Vec<RingOverlay>,
+    text_lines: Vec<OverlayTextLine>,
+}
+
+#[derive(Debug, Clone)]
+enum SvgOverlay {
+    Metric(MetricOverlay),
+    Depth(DepthOverlay),
+}
+
+#[derive(Debug, Clone)]
 struct Snapshot {
     source_label: String,
     snapshot_label: Option<String>,
     counts: StatusCounts,
     request_metrics: Option<RequestMetrics>,
+    layer_coverage: LayerCoverage,
     layers: [LayerBreakdown; 3],
 }
 
@@ -170,10 +223,20 @@ struct CountBucket {
     count: u64,
 }
 
+#[derive(Debug, Clone, Copy, Default)]
+struct LayerCoverage {
+    pathway_rows: u64,
+    superclass_rows: u64,
+    class_rows: u64,
+}
+
 #[derive(Debug, Default)]
 struct LayerAccumulator {
     classified_rows: u64,
     empty_rows: u64,
+    pathway_rows: u64,
+    superclass_rows: u64,
+    class_rows: u64,
     pathway_counts: HashMap<String, u64>,
     superclass_counts: HashMap<String, u64>,
     class_counts: HashMap<String, u64>,
@@ -181,13 +244,24 @@ struct LayerAccumulator {
 
 impl LayerAccumulator {
     fn record(&mut self, record: CompletedRecord) {
-        let has_labels = !record.pathway_results.is_empty()
-            || !record.superclass_results.is_empty()
-            || !record.class_results.is_empty();
+        let has_pathway = !record.pathway_results.is_empty();
+        let has_superclass = !record.superclass_results.is_empty();
+        let has_class = !record.class_results.is_empty();
+        let has_labels = has_pathway || has_superclass || has_class;
         if has_labels {
             self.classified_rows += 1;
         } else {
             self.empty_rows += 1;
+        }
+
+        if has_pathway {
+            self.pathway_rows += 1;
+        }
+        if has_superclass {
+            self.superclass_rows += 1;
+        }
+        if has_class {
+            self.class_rows += 1;
         }
 
         tally_labels(&mut self.pathway_counts, record.pathway_results);
@@ -195,10 +269,15 @@ impl LayerAccumulator {
         tally_labels(&mut self.class_counts, record.class_results);
     }
 
-    fn into_layers(self) -> (u64, u64, [LayerBreakdown; 3]) {
+    fn into_layers(self) -> (u64, u64, LayerCoverage, [LayerBreakdown; 3]) {
         (
             self.classified_rows,
             self.empty_rows,
+            LayerCoverage {
+                pathway_rows: self.pathway_rows,
+                superclass_rows: self.superclass_rows,
+                class_rows: self.class_rows,
+            },
             [
                 finalize_breakdown("Pathway", self.pathway_counts),
                 finalize_breakdown("Superclass", self.superclass_counts),
@@ -271,7 +350,7 @@ fn load_from_zenodo(args: &Args) -> io::Result<Snapshot> {
 
     let total_pubchem = resolve_pubchem_total(args, manifest.pubchem_total)?;
     let accumulator = accumulate_completed_dataset(&dataset_path)?;
-    let (classified, empty, layers) = accumulator.into_layers();
+    let (classified, empty, layer_coverage, layers) = accumulator.into_layers();
     let successful = classified + empty;
     if successful != manifest.successful_rows {
         return Err(io::Error::other(format!(
@@ -291,6 +370,7 @@ fn load_from_zenodo(args: &Args) -> io::Result<Snapshot> {
         source_label: format!("latest Zenodo snapshot ({})", args.zenodo_doi),
         snapshot_label: Some(manifest.created_at.clone()),
         request_metrics: manifest_request_metrics(&manifest),
+        layer_coverage,
         counts: StatusCounts {
             classified,
             empty,
@@ -366,6 +446,46 @@ fn open_input_reader(path: &Path) -> io::Result<Box<dyn BufRead>> {
         )));
     }
     Ok(Box::new(BufReader::with_capacity(8 * 1024 * 1024, file)))
+}
+
+fn ensure_plotters_font() -> io::Result<()> {
+    static FONT_INIT: OnceLock<Result<(), String>> = OnceLock::new();
+
+    FONT_INIT
+        .get_or_init(|| initialize_plotters_font().map_err(|error| error.to_string()))
+        .clone()
+        .map_err(io::Error::other)
+}
+
+fn initialize_plotters_font() -> io::Result<()> {
+    let mut candidates: Vec<PathBuf> = Vec::new();
+    if let Some(path) = std::env::var_os(FONT_ENV) {
+        candidates.push(PathBuf::from(path));
+    }
+    candidates.extend(FONT_CANDIDATES.iter().map(PathBuf::from));
+
+    for candidate in &candidates {
+        if !candidate.is_file() {
+            continue;
+        }
+
+        let bytes = fs::read(candidate)?;
+        let leaked = Box::leak(bytes.into_boxed_slice());
+        register_font("sans-serif", FontStyle::Normal, leaked).map_err(|_| {
+            io::Error::other(format!(
+                "failed to register plotters font from {}",
+                candidate.display()
+            ))
+        })?;
+        return Ok(());
+    }
+
+    Err(io::Error::new(
+        io::ErrorKind::NotFound,
+        format!(
+            "no usable TTF font found for PNG text rendering; set {FONT_ENV} or install DejaVu Sans"
+        ),
+    ))
 }
 
 fn parse_input_line(line: &str) -> Option<(u64, &str)> {
@@ -456,6 +576,7 @@ fn render_snapshot(snapshot: &Snapshot, output: &Path, top_n: usize) -> io::Resu
         }
     }
 
+    ensure_plotters_font()?;
     let height = dashboard_height(snapshot, top_n);
 
     match output
@@ -466,11 +587,14 @@ fn render_snapshot(snapshot: &Snapshot, output: &Path, top_n: usize) -> io::Resu
     {
         Some("svg") | None => {
             let root = SVGBackend::new(output, (WIDTH, height)).into_drawing_area();
-            render_area(root, snapshot, top_n)
+            let mut overlays = Vec::with_capacity(3);
+            render_area(root, snapshot, top_n, true, &mut overlays)?;
+            inject_svg_overlays(output, &overlays)
         }
         Some("png") => {
             let root = BitMapBackend::new(output, (WIDTH, height)).into_drawing_area();
-            render_area(root, snapshot, top_n)
+            let mut overlays = Vec::new();
+            render_area(root, snapshot, top_n, false, &mut overlays)
         }
         Some(other) => Err(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -483,6 +607,8 @@ fn render_area<DB: DrawingBackend>(
     root: DrawingArea<DB, Shift>,
     snapshot: &Snapshot,
     top_n: usize,
+    collect_svg_overlays: bool,
+    overlays: &mut Vec<SvgOverlay>,
 ) -> io::Result<()>
 where
     DB::ErrorType: std::error::Error + Send + Sync + 'static,
@@ -491,12 +617,23 @@ where
 
     let (header, body) = root.split_vertically(HEADER_HEIGHT);
     let (metrics_row, layers_row) = body.split_vertically(METRICS_ROW_HEIGHT);
-    let metric_panels = metrics_row.split_evenly((1, 2));
+    let metric_panels = metrics_row.split_evenly((1, 3));
     let layer_panels = layers_row.split_evenly((1, 3));
 
     draw_header(&header, snapshot)?;
-    draw_metric_panel(&metric_panels[0], &build_coverage_panel(snapshot))?;
-    draw_metric_panel(&metric_panels[1], &build_secondary_panel(snapshot))?;
+    draw_metric_panel(
+        &metric_panels[0],
+        &build_coverage_panel(snapshot),
+        collect_svg_overlays,
+        overlays,
+    )?;
+    draw_metric_panel(
+        &metric_panels[1],
+        &build_secondary_panel(snapshot),
+        collect_svg_overlays,
+        overlays,
+    )?;
+    draw_depth_panel(&metric_panels[2], snapshot, collect_svg_overlays, overlays)?;
 
     draw_layer_panel(&layer_panels[0], &snapshot.layers[0], PATHWAY_COLOR, top_n)?;
     draw_layer_panel(
@@ -595,17 +732,22 @@ fn build_secondary_panel(snapshot: &Snapshot) -> MetricPanel {
             "{} terminal rows recorded in this source",
             format_number(snapshot.counts.executed())
         ),
-        center_value: format_number(snapshot.counts.unsuccessful()),
-        center_caption: "terminal rejects".to_string(),
+        center_value: format_number(snapshot.counts.empty),
+        center_caption: "empty rows".to_string(),
         footer_note: Some("Published manifest has no per-request totals.".to_string()),
         slices: vec![
             MetricSlice {
                 label: format!(
-                    "Successful rows: {}",
-                    format_number(snapshot.counts.successful())
+                    "Classified rows: {}",
+                    format_number(snapshot.counts.classified)
                 ),
-                value: snapshot.counts.successful(),
+                value: snapshot.counts.classified,
                 color: SUCCESS_COLOR,
+            },
+            MetricSlice {
+                label: format!("Empty rows: {}", format_number(snapshot.counts.empty)),
+                value: snapshot.counts.empty,
+                color: EMPTY_COLOR,
             },
             MetricSlice {
                 label: format!("Invalid rows: {}", format_number(snapshot.counts.invalid)),
@@ -643,7 +785,7 @@ where
         .map_err(plotters_error)?;
     panel
         .draw(&Text::new(
-            "Coverage, terminal outcomes, and taxonomy distribution for the current crawl snapshot.",
+            "Coverage, terminal outcomes, taxonomy depth, and label distribution for the current crawl snapshot.",
             (24, 60),
             description_style,
         ))
@@ -677,12 +819,13 @@ where
 fn draw_metric_panel<DB: DrawingBackend>(
     area: &DrawingArea<DB, Shift>,
     metric: &MetricPanel,
+    collect_svg_overlays: bool,
+    overlays: &mut Vec<SvgOverlay>,
 ) -> io::Result<()>
 where
     DB::ErrorType: std::error::Error + Send + Sync + 'static,
 {
     let panel = prepare_panel(area)?;
-    let screen_panel = panel.use_screen_coord();
     panel
         .draw(&Text::new(
             metric.title.clone(),
@@ -722,48 +865,52 @@ where
     }
 
     let dims = panel.dim_in_pixel();
-    let center = (dims.0 as i32 - 180, dims.1 as i32 / 2 + 14);
+    let center = (
+        dims.0 as i32 - 180,
+        dims.1 as i32 / 2 + CIRCLE_CENTER_Y_OFFSET,
+    );
     let radius = (f64::from(dims.1) * 0.34)
         .min(f64::from(dims.0) * 0.16)
         .max(78.0);
-    let sizes: Vec<f64> = metric
-        .slices
-        .iter()
-        .map(|slice| slice.value as f64)
-        .collect();
-    let colors: Vec<RGBColor> = metric.slices.iter().map(|slice| slice.color).collect();
-    let labels = vec![""; metric.slices.len()];
-
-    let (x_range, y_range) = panel.get_pixel_range();
-    let center_abs = (x_range.end - 180, (y_range.start + y_range.end) / 2 + 14);
-
-    let mut pie = Pie::new(&center_abs, &radius, &sizes, &colors, &labels);
-    pie.start_angle(-90.0);
-    pie.donut_hole(radius * 0.62);
-
-    screen_panel.draw(&pie).map_err(plotters_error)?;
-    let value_style = TextStyle::from(("sans-serif", 28).into_font()).color(&TEXT);
-    let caption_style = TextStyle::from(("sans-serif", 15).into_font()).color(&MUTED);
-    let (value_w, _) = panel
-        .estimate_text_size(&metric.center_value, &value_style)
-        .map_err(plotters_error)?;
-    let (caption_w, _) = panel
-        .estimate_text_size(&metric.center_caption, &caption_style)
-        .map_err(plotters_error)?;
-    panel
-        .draw(&Text::new(
-            metric.center_value.clone(),
-            (center.0 - value_w as i32 / 2, center.1 - 18),
-            value_style,
-        ))
-        .map_err(plotters_error)?;
-    panel
-        .draw(&Text::new(
-            metric.center_caption.clone(),
-            (center.0 - caption_w as i32 / 2, center.1 + 12),
-            caption_style,
-        ))
-        .map_err(plotters_error)?;
+    let hole_radius = radius * 0.68;
+    if collect_svg_overlays {
+        overlays.push(build_metric_overlay(
+            &panel,
+            metric,
+            center,
+            radius,
+            hole_radius,
+        ));
+    } else {
+        let slices: Vec<(u64, RGBColor)> = metric
+            .slices
+            .iter()
+            .map(|slice| (slice.value, slice.color))
+            .collect();
+        draw_donut_chart(&panel, radius, hole_radius, center, &slices)?;
+        let value_style = TextStyle::from(("sans-serif", 28).into_font()).color(&TEXT);
+        let caption_style = TextStyle::from(("sans-serif", 15).into_font()).color(&MUTED);
+        let (value_w, _) = panel
+            .estimate_text_size(&metric.center_value, &value_style)
+            .map_err(plotters_error)?;
+        let (caption_w, _) = panel
+            .estimate_text_size(&metric.center_caption, &caption_style)
+            .map_err(plotters_error)?;
+        panel
+            .draw(&Text::new(
+                metric.center_value.clone(),
+                (center.0 - value_w as i32 / 2, center.1 - 18),
+                value_style,
+            ))
+            .map_err(plotters_error)?;
+        panel
+            .draw(&Text::new(
+                metric.center_caption.clone(),
+                (center.0 - caption_w as i32 / 2, center.1 + 12),
+                caption_style,
+            ))
+            .map_err(plotters_error)?;
+    }
 
     let mut current_y = if metric.footer_note.is_some() {
         106
@@ -776,6 +923,379 @@ where
     }
 
     Ok(())
+}
+
+fn draw_depth_panel<DB: DrawingBackend>(
+    area: &DrawingArea<DB, Shift>,
+    snapshot: &Snapshot,
+    collect_svg_overlays: bool,
+    overlays: &mut Vec<SvgOverlay>,
+) -> io::Result<()>
+where
+    DB::ErrorType: std::error::Error + Send + Sync + 'static,
+{
+    let panel = prepare_panel(area)?;
+    panel
+        .draw(&Text::new(
+            "Taxonomy Depth Coverage",
+            (24, 28),
+            TextStyle::from(("sans-serif", 24).into_font()).color(&TEXT),
+        ))
+        .map_err(plotters_error)?;
+    panel
+        .draw(&Text::new(
+            "Share of successful rows with pathway, superclass, and class labels.",
+            (24, 54),
+            TextStyle::from(("sans-serif", 17).into_font()).color(&MUTED),
+        ))
+        .map_err(plotters_error)?;
+
+    let total = snapshot.counts.successful();
+    if total == 0 {
+        panel
+            .draw(&Text::new(
+                "No successful rows available yet",
+                (24, 112),
+                TextStyle::from(("sans-serif", 20).into_font()).color(&TEXT),
+            ))
+            .map_err(plotters_error)?;
+        return Ok(());
+    }
+
+    let dims = panel.dim_in_pixel();
+    let center = (
+        dims.0 as i32 - 150,
+        dims.1 as i32 / 2 + CIRCLE_CENTER_Y_OFFSET,
+    );
+    let outer_radius = (f64::from(dims.1) * 0.34)
+        .min(f64::from(dims.0) * 0.22)
+        .max(84.0);
+    let ring_width = (outer_radius * 0.18).max(12.0);
+    let ring_gap = (outer_radius * 0.07).max(5.0);
+    if collect_svg_overlays {
+        overlays.push(build_depth_overlay(
+            &panel,
+            center,
+            outer_radius,
+            ring_width,
+            ring_gap,
+            snapshot,
+            total,
+        ));
+    } else {
+        draw_depth_ring(
+            &panel,
+            center,
+            outer_radius,
+            ring_width,
+            snapshot.layer_coverage.pathway_rows,
+            total,
+            PATHWAY_COLOR,
+        )?;
+        draw_depth_ring(
+            &panel,
+            center,
+            outer_radius - ring_width - ring_gap,
+            ring_width,
+            snapshot.layer_coverage.superclass_rows,
+            total,
+            SUPERCLASS_COLOR,
+        )?;
+        draw_depth_ring(
+            &panel,
+            center,
+            outer_radius - 2.0 * (ring_width + ring_gap),
+            ring_width,
+            snapshot.layer_coverage.class_rows,
+            total,
+            CLASS_COLOR,
+        )?;
+
+        let value_style = TextStyle::from(("sans-serif", 24).into_font()).color(&TEXT);
+        let caption_style = TextStyle::from(("sans-serif", 15).into_font()).color(&MUTED);
+        let center_value = format_number(total);
+        let center_caption = "successful rows";
+        let (value_w, _) = panel
+            .estimate_text_size(&center_value, &value_style)
+            .map_err(plotters_error)?;
+        let (caption_w, _) = panel
+            .estimate_text_size(center_caption, &caption_style)
+            .map_err(plotters_error)?;
+        panel
+            .draw(&Text::new(
+                center_value,
+                (center.0 - value_w as i32 / 2, center.1 - 18),
+                value_style,
+            ))
+            .map_err(plotters_error)?;
+        panel
+            .draw(&Text::new(
+                center_caption,
+                (center.0 - caption_w as i32 / 2, center.1 + 10),
+                caption_style,
+            ))
+            .map_err(plotters_error)?;
+    }
+
+    draw_legend_entry(
+        &panel,
+        (24, 110),
+        PATHWAY_COLOR,
+        format!(
+            "Pathway rows: {} | {}",
+            format_percent(snapshot.layer_coverage.pathway_rows, total),
+            format_number(snapshot.layer_coverage.pathway_rows)
+        ),
+    )?;
+    draw_legend_entry(
+        &panel,
+        (24, 136),
+        SUPERCLASS_COLOR,
+        format!(
+            "Superclass rows: {} | {}",
+            format_percent(snapshot.layer_coverage.superclass_rows, total),
+            format_number(snapshot.layer_coverage.superclass_rows)
+        ),
+    )?;
+    draw_legend_entry(
+        &panel,
+        (24, 162),
+        CLASS_COLOR,
+        format!(
+            "Class rows: {} | {}",
+            format_percent(snapshot.layer_coverage.class_rows, total),
+            format_number(snapshot.layer_coverage.class_rows)
+        ),
+    )?;
+
+    Ok(())
+}
+
+fn build_metric_overlay<DB: DrawingBackend>(
+    panel: &DrawingArea<DB, Shift>,
+    metric: &MetricPanel,
+    center: (i32, i32),
+    outer_radius: f64,
+    inner_radius: f64,
+) -> SvgOverlay
+where
+    DB::ErrorType: std::error::Error + Send + Sync + 'static,
+{
+    let (x_range, y_range) = panel.get_pixel_range();
+    let center_abs = (x_range.start + center.0, y_range.start + center.1);
+    SvgOverlay::Metric(MetricOverlay {
+        center: center_abs,
+        outer_radius,
+        inner_radius,
+        slices: metric.slices.clone(),
+        text_lines: vec![
+            OverlayTextLine {
+                text: metric.center_value.clone(),
+                center_x: center_abs.0,
+                y: center_abs.1 - 18,
+                font_size: 28.0,
+                color: TEXT,
+            },
+            OverlayTextLine {
+                text: metric.center_caption.clone(),
+                center_x: center_abs.0,
+                y: center_abs.1 + 12,
+                font_size: 15.0,
+                color: MUTED,
+            },
+        ],
+    })
+}
+
+fn build_depth_overlay<DB: DrawingBackend>(
+    panel: &DrawingArea<DB, Shift>,
+    center: (i32, i32),
+    outer_radius: f64,
+    ring_width: f64,
+    ring_gap: f64,
+    snapshot: &Snapshot,
+    total: u64,
+) -> SvgOverlay
+where
+    DB::ErrorType: std::error::Error + Send + Sync + 'static,
+{
+    let (x_range, y_range) = panel.get_pixel_range();
+    let center_abs = (x_range.start + center.0, y_range.start + center.1);
+    SvgOverlay::Depth(DepthOverlay {
+        center: center_abs,
+        rings: vec![
+            RingOverlay {
+                outer_radius,
+                inner_radius: (outer_radius - ring_width).max(0.0),
+                value: snapshot.layer_coverage.pathway_rows,
+                total,
+                color: PATHWAY_COLOR,
+                background: REMAINING_COLOR,
+            },
+            RingOverlay {
+                outer_radius: outer_radius - ring_width - ring_gap,
+                inner_radius: (outer_radius - 2.0 * ring_width - ring_gap).max(0.0),
+                value: snapshot.layer_coverage.superclass_rows,
+                total,
+                color: SUPERCLASS_COLOR,
+                background: REMAINING_COLOR,
+            },
+            RingOverlay {
+                outer_radius: outer_radius - 2.0 * (ring_width + ring_gap),
+                inner_radius: (outer_radius - 3.0 * ring_width - 2.0 * ring_gap).max(0.0),
+                value: snapshot.layer_coverage.class_rows,
+                total,
+                color: CLASS_COLOR,
+                background: REMAINING_COLOR,
+            },
+        ],
+        text_lines: vec![
+            OverlayTextLine {
+                text: format_number(total),
+                center_x: center_abs.0,
+                y: center_abs.1 - 18,
+                font_size: 24.0,
+                color: TEXT,
+            },
+            OverlayTextLine {
+                text: "successful rows".to_string(),
+                center_x: center_abs.0,
+                y: center_abs.1 + 10,
+                font_size: 15.0,
+                color: MUTED,
+            },
+        ],
+    })
+}
+
+fn draw_depth_ring<DB: DrawingBackend>(
+    area: &DrawingArea<DB, Shift>,
+    center: (i32, i32),
+    outer_radius: f64,
+    ring_width: f64,
+    value: u64,
+    total: u64,
+    color: RGBColor,
+) -> io::Result<()>
+where
+    DB::ErrorType: std::error::Error + Send + Sync + 'static,
+{
+    let inner_radius = (outer_radius - ring_width).max(0.0);
+    draw_annulus(area, center, outer_radius, inner_radius, REMAINING_COLOR)?;
+    if value > 0 && total > 0 {
+        let sweep = TAU * (value as f64 / total as f64);
+        draw_annulus_sector(
+            area,
+            center,
+            outer_radius,
+            inner_radius,
+            -FRAC_PI_2,
+            -FRAC_PI_2 + sweep,
+            color,
+        )?;
+    }
+    Ok(())
+}
+
+fn draw_donut_chart<DB: DrawingBackend>(
+    area: &DrawingArea<DB, Shift>,
+    outer_radius: f64,
+    inner_radius: f64,
+    center: (i32, i32),
+    slices: &[(u64, RGBColor)],
+) -> io::Result<()>
+where
+    DB::ErrorType: std::error::Error + Send + Sync + 'static,
+{
+    let total: u64 = slices.iter().map(|(value, _)| *value).sum();
+    if total == 0 {
+        return Ok(());
+    }
+
+    let mut angle = -FRAC_PI_2;
+    for &(value, color) in slices {
+        if value == 0 {
+            continue;
+        }
+        let sweep = TAU * (value as f64 / total as f64);
+        draw_annulus_sector(
+            area,
+            center,
+            outer_radius,
+            inner_radius,
+            angle,
+            angle + sweep,
+            color,
+        )?;
+        angle += sweep;
+    }
+
+    Ok(())
+}
+
+fn draw_annulus<DB: DrawingBackend>(
+    area: &DrawingArea<DB, Shift>,
+    center: (i32, i32),
+    outer_radius: f64,
+    inner_radius: f64,
+    color: RGBColor,
+) -> io::Result<()>
+where
+    DB::ErrorType: std::error::Error + Send + Sync + 'static,
+{
+    draw_annulus_sector(area, center, outer_radius, inner_radius, 0.0, TAU, color)
+}
+
+fn draw_annulus_sector<DB: DrawingBackend>(
+    area: &DrawingArea<DB, Shift>,
+    center: (i32, i32),
+    outer_radius: f64,
+    inner_radius: f64,
+    start_angle: f64,
+    end_angle: f64,
+    color: RGBColor,
+) -> io::Result<()>
+where
+    DB::ErrorType: std::error::Error + Send + Sync + 'static,
+{
+    let points = annulus_sector_points(center, outer_radius, inner_radius, start_angle, end_angle);
+    area.draw(&Polygon::new(points, color.filled()))
+        .map_err(plotters_error)?;
+    Ok(())
+}
+
+fn annulus_sector_points(
+    center: (i32, i32),
+    outer_radius: f64,
+    inner_radius: f64,
+    start_angle: f64,
+    end_angle: f64,
+) -> Vec<(i32, i32)> {
+    let sweep = (end_angle - start_angle).abs();
+    let step_count = ((sweep / TAU) * 360.0).ceil() as usize;
+    let outer_steps = step_count.max(8);
+    let inner_steps = step_count.max(8);
+    let mut points = Vec::with_capacity(outer_steps + inner_steps + 2);
+
+    for step in 0..=outer_steps {
+        let t = step as f64 / outer_steps as f64;
+        let angle = start_angle + (end_angle - start_angle) * t;
+        points.push(polar_to_point(center, outer_radius, angle));
+    }
+    for step in (0..=inner_steps).rev() {
+        let t = step as f64 / inner_steps as f64;
+        let angle = start_angle + (end_angle - start_angle) * t;
+        points.push(polar_to_point(center, inner_radius, angle));
+    }
+
+    points
+}
+
+fn polar_to_point(center: (i32, i32), radius: f64, angle: f64) -> (i32, i32) {
+    (
+        center.0 + (radius * angle.cos()).round() as i32,
+        center.1 + (radius * angle.sin()).round() as i32,
+    )
 }
 
 fn draw_layer_panel<DB: DrawingBackend>(
@@ -1028,6 +1548,207 @@ where
     Ok(area.clone())
 }
 
+fn inject_svg_overlays(output_path: &Path, overlays: &[SvgOverlay]) -> io::Result<()> {
+    if overlays.is_empty() {
+        return Ok(());
+    }
+
+    let mut svg = fs::read_to_string(output_path)?;
+    let insertion_point = svg.rfind("</svg>").ok_or_else(|| {
+        io::Error::other(format!(
+            "missing closing </svg> in {}",
+            output_path.display()
+        ))
+    })?;
+
+    let mut markup = String::new();
+    for overlay in overlays {
+        markup.push_str(&render_svg_overlay(overlay));
+    }
+    svg.insert_str(insertion_point, &markup);
+    fs::write(output_path, svg)
+}
+
+fn render_svg_overlay(overlay: &SvgOverlay) -> String {
+    match overlay {
+        SvgOverlay::Metric(overlay) => render_metric_overlay_svg(overlay),
+        SvgOverlay::Depth(overlay) => render_depth_overlay_svg(overlay),
+    }
+}
+
+fn render_metric_overlay_svg(overlay: &MetricOverlay) -> String {
+    let mut markup = String::from(
+        "\n<g data-role=\"metric-donut-overlay\" shape-rendering=\"geometricPrecision\">\n",
+    );
+    let total: u64 = overlay.slices.iter().map(|slice| slice.value).sum();
+    let mut start_angle = -FRAC_PI_2;
+    for slice in overlay.slices.iter().filter(|slice| slice.value > 0) {
+        let sweep = slice.value as f64 / total as f64 * TAU;
+        markup.push_str("  <path fill=\"");
+        markup.push_str(&svg_color(slice.color));
+        markup.push_str("\" d=\"");
+        markup.push_str(&donut_slice_path(
+            overlay.center,
+            overlay.outer_radius,
+            overlay.inner_radius,
+            start_angle,
+            start_angle + sweep,
+        ));
+        markup.push_str("\"/>\n");
+        start_angle += sweep;
+    }
+    for line in &overlay.text_lines {
+        markup.push_str(&render_svg_text_line(line));
+    }
+    markup.push_str("</g>\n");
+    markup
+}
+
+fn render_depth_overlay_svg(overlay: &DepthOverlay) -> String {
+    let mut markup = String::from(
+        "\n<g data-role=\"taxonomy-depth-overlay\" shape-rendering=\"geometricPrecision\">\n",
+    );
+    for ring in &overlay.rings {
+        markup.push_str("  <path fill=\"");
+        markup.push_str(&svg_color(ring.background));
+        markup.push_str("\" d=\"");
+        markup.push_str(&full_ring_path(
+            overlay.center,
+            ring.outer_radius,
+            ring.inner_radius,
+            -FRAC_PI_2,
+        ));
+        markup.push_str("\"/>\n");
+        if ring.value > 0 && ring.total > 0 {
+            let sweep = ring.value as f64 / ring.total as f64 * TAU;
+            markup.push_str("  <path fill=\"");
+            markup.push_str(&svg_color(ring.color));
+            markup.push_str("\" d=\"");
+            markup.push_str(&donut_slice_path(
+                overlay.center,
+                ring.outer_radius,
+                ring.inner_radius,
+                -FRAC_PI_2,
+                -FRAC_PI_2 + sweep,
+            ));
+            markup.push_str("\"/>\n");
+        }
+    }
+    for line in &overlay.text_lines {
+        markup.push_str(&render_svg_text_line(line));
+    }
+    markup.push_str("</g>\n");
+    markup
+}
+
+fn render_svg_text_line(line: &OverlayTextLine) -> String {
+    format!(
+        "  <text x=\"{}\" y=\"{}\" dy=\"0.76em\" text-anchor=\"middle\" font-family=\"sans-serif\" font-size=\"{:.6}\" opacity=\"1\" fill=\"{}\">{}</text>\n",
+        line.center_x,
+        line.y,
+        svg_font_size(line.font_size),
+        svg_color(line.color),
+        escape_svg_text(&line.text),
+    )
+}
+
+fn donut_slice_path(
+    center: (i32, i32),
+    outer_radius: f64,
+    inner_radius: f64,
+    start_angle: f64,
+    end_angle: f64,
+) -> String {
+    let sweep = end_angle - start_angle;
+    if sweep.abs() >= TAU - 1e-6 {
+        return full_ring_path(center, outer_radius, inner_radius, start_angle);
+    }
+
+    let outer_start = polar_point(center, outer_radius, start_angle);
+    let outer_end = polar_point(center, outer_radius, end_angle);
+    let inner_end = polar_point(center, inner_radius, end_angle);
+    let inner_start = polar_point(center, inner_radius, start_angle);
+    let large_arc = i32::from(sweep.abs() > std::f64::consts::PI);
+
+    format!(
+        "M {} A {:.3} {:.3} 0 {} 1 {} L {} A {:.3} {:.3} 0 {} 0 {} Z",
+        svg_point(outer_start),
+        outer_radius,
+        outer_radius,
+        large_arc,
+        svg_point(outer_end),
+        svg_point(inner_end),
+        inner_radius,
+        inner_radius,
+        large_arc,
+        svg_point(inner_start),
+    )
+}
+
+fn full_ring_path(
+    center: (i32, i32),
+    outer_radius: f64,
+    inner_radius: f64,
+    start_angle: f64,
+) -> String {
+    let outer_start = polar_point(center, outer_radius, start_angle);
+    let outer_mid = polar_point(center, outer_radius, start_angle + std::f64::consts::PI);
+    let inner_start = polar_point(center, inner_radius, start_angle);
+    let inner_mid = polar_point(center, inner_radius, start_angle + std::f64::consts::PI);
+
+    format!(
+        "M {} A {:.3} {:.3} 0 1 1 {} A {:.3} {:.3} 0 1 1 {} L {} A {:.3} {:.3} 0 1 0 {} A {:.3} {:.3} 0 1 0 {} Z",
+        svg_point(outer_start),
+        outer_radius,
+        outer_radius,
+        svg_point(outer_mid),
+        outer_radius,
+        outer_radius,
+        svg_point(outer_start),
+        svg_point(inner_start),
+        inner_radius,
+        inner_radius,
+        svg_point(inner_mid),
+        inner_radius,
+        inner_radius,
+        svg_point(inner_start),
+    )
+}
+
+fn polar_point(center: (i32, i32), radius: f64, angle: f64) -> (f64, f64) {
+    (
+        center.0 as f64 + radius * angle.cos(),
+        center.1 as f64 + radius * angle.sin(),
+    )
+}
+
+fn svg_point(point: (f64, f64)) -> String {
+    format!("{:.3} {:.3}", point.0, point.1)
+}
+
+fn svg_color(color: RGBColor) -> String {
+    format!("#{:02X}{:02X}{:02X}", color.0, color.1, color.2)
+}
+
+fn svg_font_size(size: f64) -> f64 {
+    size * (25.0 / 31.0)
+}
+
+fn escape_svg_text(text: &str) -> String {
+    let mut escaped = String::with_capacity(text.len());
+    for character in text.chars() {
+        match character {
+            '&' => escaped.push_str("&amp;"),
+            '<' => escaped.push_str("&lt;"),
+            '>' => escaped.push_str("&gt;"),
+            '"' => escaped.push_str("&quot;"),
+            '\'' => escaped.push_str("&apos;"),
+            _ => escaped.push(character),
+        }
+    }
+    escaped
+}
+
 fn format_number(value: u64) -> String {
     let digits = value.to_string();
     let mut formatted = String::with_capacity(digits.len() + digits.len() / 3);
@@ -1171,9 +1892,12 @@ mod tests {
 
         let accumulator =
             accumulate_completed_dataset(&dataset_path).expect("read completed dataset");
-        let (classified, empty, layers) = accumulator.into_layers();
+        let (classified, empty, coverage, layers) = accumulator.into_layers();
         assert_eq!(classified, 1);
         assert_eq!(empty, 1);
+        assert_eq!(coverage.pathway_rows, 1);
+        assert_eq!(coverage.superclass_rows, 1);
+        assert_eq!(coverage.class_rows, 1);
         assert_eq!(layers[0].assignment_total, 1);
         assert_eq!(layers[1].labels[0].label, "Nitrogen compounds");
         assert_eq!(layers[2].labels[0].label, "Alkaloids");
@@ -1216,6 +1940,11 @@ mod tests {
                 pending: 4,
             },
             request_metrics: None,
+            layer_coverage: LayerCoverage {
+                pathway_rows: 4,
+                superclass_rows: 3,
+                class_rows: 2,
+            },
             layers: [
                 LayerBreakdown {
                     title: "Pathway",
@@ -1255,7 +1984,69 @@ mod tests {
         assert!(svg.contains("<svg"));
         assert!(svg.contains("Collected vs PubChem"));
         assert!(svg.contains("Terminal Row Outcomes"));
+        assert!(svg.contains("Taxonomy Depth Coverage"));
         assert!(svg.contains("Class Breakdown"));
+        assert!(svg.contains("data-role=\"metric-donut-overlay\""));
+        assert!(svg.contains("data-role=\"taxonomy-depth-overlay\""));
+    }
+
+    #[test]
+    fn renderer_emits_png() {
+        let temp_dir = test_dir("render-png");
+        let output = temp_dir.join("progress.png");
+        let snapshot = Snapshot {
+            source_label: "latest Zenodo snapshot (10.5281/zenodo.14040990)".to_string(),
+            snapshot_label: Some("2026-04-14T12:00:00Z".to_string()),
+            counts: StatusCounts {
+                classified: 4,
+                empty: 1,
+                invalid: 1,
+                failed: 0,
+                pending: 4,
+            },
+            request_metrics: None,
+            layer_coverage: LayerCoverage {
+                pathway_rows: 4,
+                superclass_rows: 3,
+                class_rows: 2,
+            },
+            layers: [
+                LayerBreakdown {
+                    title: "Pathway",
+                    assignment_total: 4,
+                    labels: vec![
+                        CountBucket {
+                            label: "A".to_string(),
+                            count: 3,
+                        },
+                        CountBucket {
+                            label: "B".to_string(),
+                            count: 1,
+                        },
+                    ],
+                },
+                LayerBreakdown {
+                    title: "Superclass",
+                    assignment_total: 3,
+                    labels: vec![CountBucket {
+                        label: "B".to_string(),
+                        count: 3,
+                    }],
+                },
+                LayerBreakdown {
+                    title: "Class",
+                    assignment_total: 2,
+                    labels: vec![CountBucket {
+                        label: "C".to_string(),
+                        count: 2,
+                    }],
+                },
+            ],
+        };
+
+        render_snapshot(&snapshot, &output, 5).expect("render png");
+        let metadata = fs::metadata(&output).expect("stat png");
+        assert!(metadata.len() > 10_000, "png output looked too small");
     }
 
     fn test_dir(label: &str) -> PathBuf {
