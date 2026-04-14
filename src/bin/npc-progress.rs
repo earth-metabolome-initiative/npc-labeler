@@ -52,11 +52,11 @@ struct Args {
     #[arg(long, default_value = "progress.svg")]
     output: PathBuf,
 
-    /// Path to the PubChem CID-SMILES input used to define the total crawl universe.
+    /// Path to the `PubChem` CID-SMILES input used to define the total crawl universe.
     #[arg(long, default_value = "CID-SMILES.gz")]
     input: PathBuf,
 
-    /// Optional explicit PubChem total. Use this to avoid rescanning the input file.
+    /// Optional explicit `PubChem` total. Use this to avoid rescanning the input file.
     #[arg(long)]
     pubchem_total: Option<u64>,
 
@@ -173,7 +173,7 @@ enum SvgOverlay {
 #[derive(Debug, Clone)]
 struct Snapshot {
     source_label: String,
-    snapshot_label: Option<String>,
+    timestamp_label: Option<String>,
     counts: StatusCounts,
     request_metrics: Option<RequestMetrics>,
     layer_coverage: LayerCoverage,
@@ -225,9 +225,9 @@ struct CountBucket {
 
 #[derive(Debug, Clone, Copy, Default)]
 struct LayerCoverage {
-    pathway_rows: u64,
-    superclass_rows: u64,
-    class_rows: u64,
+    pathway: u64,
+    superclass: u64,
+    class: u64,
 }
 
 #[derive(Debug, Default)]
@@ -244,9 +244,9 @@ struct LayerAccumulator {
 
 impl LayerAccumulator {
     fn record(&mut self, record: CompletedRecord) {
-        let has_pathway = !record.pathway_results.is_empty();
-        let has_superclass = !record.superclass_results.is_empty();
-        let has_class = !record.class_results.is_empty();
+        let has_pathway = !record.pathways.is_empty();
+        let has_superclass = !record.superclasses.is_empty();
+        let has_class = !record.classes.is_empty();
         let has_labels = has_pathway || has_superclass || has_class;
         if has_labels {
             self.classified_rows += 1;
@@ -264,9 +264,9 @@ impl LayerAccumulator {
             self.class_rows += 1;
         }
 
-        tally_labels(&mut self.pathway_counts, record.pathway_results);
-        tally_labels(&mut self.superclass_counts, record.superclass_results);
-        tally_labels(&mut self.class_counts, record.class_results);
+        tally_labels(&mut self.pathway_counts, record.pathways);
+        tally_labels(&mut self.superclass_counts, record.superclasses);
+        tally_labels(&mut self.class_counts, record.classes);
     }
 
     fn into_layers(self) -> (u64, u64, LayerCoverage, [LayerBreakdown; 3]) {
@@ -274,9 +274,9 @@ impl LayerAccumulator {
             self.classified_rows,
             self.empty_rows,
             LayerCoverage {
-                pathway_rows: self.pathway_rows,
-                superclass_rows: self.superclass_rows,
-                class_rows: self.class_rows,
+                pathway: self.pathway_rows,
+                superclass: self.superclass_rows,
+                class: self.class_rows,
             },
             [
                 finalize_breakdown("Pathway", self.pathway_counts),
@@ -289,9 +289,12 @@ impl LayerAccumulator {
 
 #[derive(Debug, Deserialize)]
 struct CompletedRecord {
-    class_results: Vec<String>,
-    superclass_results: Vec<String>,
-    pathway_results: Vec<String>,
+    #[serde(rename = "class_results")]
+    classes: Vec<String>,
+    #[serde(rename = "superclass_results")]
+    superclasses: Vec<String>,
+    #[serde(rename = "pathway_results")]
+    pathways: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -368,7 +371,7 @@ fn load_from_zenodo(args: &Args) -> io::Result<Snapshot> {
 
     Ok(Snapshot {
         source_label: format!("latest Zenodo snapshot ({})", args.zenodo_doi),
-        snapshot_label: Some(manifest.created_at.clone()),
+        timestamp_label: Some(manifest.created_at.clone()),
         request_metrics: manifest_request_metrics(&manifest),
         layer_coverage,
         counts: StatusCounts {
@@ -506,7 +509,7 @@ fn download_latest_zenodo_file(doi: &str, key: &str, destination: &Path) -> io::
             env!("CARGO_PKG_NAME"),
             env!("CARGO_PKG_VERSION")
         ))
-        .request_timeout(Duration::from_secs(120))
+        .request_timeout(Duration::from_mins(2))
         .connect_timeout(Duration::from_secs(20))
         .build()
         .map_err(|error| io::Error::other(format!("failed to build Zenodo client: {error}")))?;
@@ -570,10 +573,10 @@ fn finalize_breakdown(title: &'static str, counts: HashMap<String, u64>) -> Laye
 }
 
 fn render_snapshot(snapshot: &Snapshot, output: &Path, top_n: usize) -> io::Result<()> {
-    if let Some(parent) = output.parent() {
-        if !parent.as_os_str().is_empty() {
-            fs::create_dir_all(parent)?;
-        }
+    if let Some(parent) = output.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        fs::create_dir_all(parent)?;
     }
 
     ensure_plotters_font()?;
@@ -588,13 +591,13 @@ fn render_snapshot(snapshot: &Snapshot, output: &Path, top_n: usize) -> io::Resu
         Some("svg") | None => {
             let root = SVGBackend::new(output, (WIDTH, height)).into_drawing_area();
             let mut overlays = Vec::with_capacity(3);
-            render_area(root, snapshot, top_n, true, &mut overlays)?;
+            render_area(&root, snapshot, top_n, true, &mut overlays)?;
             inject_svg_overlays(output, &overlays)
         }
         Some("png") => {
             let root = BitMapBackend::new(output, (WIDTH, height)).into_drawing_area();
             let mut overlays = Vec::new();
-            render_area(root, snapshot, top_n, false, &mut overlays)
+            render_area(&root, snapshot, top_n, false, &mut overlays)
         }
         Some(other) => Err(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -604,7 +607,7 @@ fn render_snapshot(snapshot: &Snapshot, output: &Path, top_n: usize) -> io::Resu
 }
 
 fn render_area<DB: DrawingBackend>(
-    root: DrawingArea<DB, Shift>,
+    root: &DrawingArea<DB, Shift>,
     snapshot: &Snapshot,
     top_n: usize,
     collect_svg_overlays: bool,
@@ -791,7 +794,7 @@ where
         ))
         .map_err(plotters_error)?;
 
-    let timestamp_text = if let Some(label) = &snapshot.snapshot_label {
+    let timestamp_text = if let Some(label) = &snapshot.timestamp_label {
         format!("Snapshot timestamp: {label}")
     } else {
         format!("Rendered: {}", Utc::now().to_rfc3339())
@@ -925,6 +928,83 @@ where
     Ok(())
 }
 
+fn draw_depth_center_text<DB: DrawingBackend>(
+    panel: &DrawingArea<DB, Shift>,
+    center: (i32, i32),
+    total: u64,
+) -> io::Result<()>
+where
+    DB::ErrorType: std::error::Error + Send + Sync + 'static,
+{
+    let value_style = TextStyle::from(("sans-serif", 24).into_font()).color(&TEXT);
+    let caption_style = TextStyle::from(("sans-serif", 15).into_font()).color(&MUTED);
+    let center_value = format_number(total);
+    let center_caption = "successful rows";
+    let (value_w, _) = panel
+        .estimate_text_size(&center_value, &value_style)
+        .map_err(plotters_error)?;
+    let (caption_w, _) = panel
+        .estimate_text_size(center_caption, &caption_style)
+        .map_err(plotters_error)?;
+    panel
+        .draw(&Text::new(
+            center_value,
+            (center.0 - value_w as i32 / 2, center.1 - 18),
+            value_style,
+        ))
+        .map_err(plotters_error)?;
+    panel
+        .draw(&Text::new(
+            center_caption,
+            (center.0 - caption_w as i32 / 2, center.1 + 10),
+            caption_style,
+        ))
+        .map_err(plotters_error)?;
+    Ok(())
+}
+
+fn draw_depth_legend<DB: DrawingBackend>(
+    panel: &DrawingArea<DB, Shift>,
+    snapshot: &Snapshot,
+    total: u64,
+) -> io::Result<()>
+where
+    DB::ErrorType: std::error::Error + Send + Sync + 'static,
+{
+    draw_legend_entry(
+        panel,
+        (24, 110),
+        PATHWAY_COLOR,
+        format!(
+            "Pathway rows: {} | {}",
+            format_percent(snapshot.layer_coverage.pathway, total),
+            format_number(snapshot.layer_coverage.pathway)
+        ),
+    )?;
+    draw_legend_entry(
+        panel,
+        (24, 136),
+        SUPERCLASS_COLOR,
+        format!(
+            "Superclass rows: {} | {}",
+            format_percent(snapshot.layer_coverage.superclass, total),
+            format_number(snapshot.layer_coverage.superclass)
+        ),
+    )?;
+    draw_legend_entry(
+        panel,
+        (24, 162),
+        CLASS_COLOR,
+        format!(
+            "Class rows: {} | {}",
+            format_percent(snapshot.layer_coverage.class, total),
+            format_number(snapshot.layer_coverage.class)
+        ),
+    )?;
+    Ok(())
+}
+
+#[allow(clippy::too_many_lines)]
 fn draw_depth_panel<DB: DrawingBackend>(
     area: &DrawingArea<DB, Shift>,
     snapshot: &Snapshot,
@@ -988,7 +1068,7 @@ where
             center,
             outer_radius,
             ring_width,
-            snapshot.layer_coverage.pathway_rows,
+            snapshot.layer_coverage.pathway,
             total,
             PATHWAY_COLOR,
         )?;
@@ -997,7 +1077,7 @@ where
             center,
             outer_radius - ring_width - ring_gap,
             ring_width,
-            snapshot.layer_coverage.superclass_rows,
+            snapshot.layer_coverage.superclass,
             total,
             SUPERCLASS_COLOR,
         )?;
@@ -1006,67 +1086,13 @@ where
             center,
             outer_radius - 2.0 * (ring_width + ring_gap),
             ring_width,
-            snapshot.layer_coverage.class_rows,
+            snapshot.layer_coverage.class,
             total,
             CLASS_COLOR,
         )?;
-
-        let value_style = TextStyle::from(("sans-serif", 24).into_font()).color(&TEXT);
-        let caption_style = TextStyle::from(("sans-serif", 15).into_font()).color(&MUTED);
-        let center_value = format_number(total);
-        let center_caption = "successful rows";
-        let (value_w, _) = panel
-            .estimate_text_size(&center_value, &value_style)
-            .map_err(plotters_error)?;
-        let (caption_w, _) = panel
-            .estimate_text_size(center_caption, &caption_style)
-            .map_err(plotters_error)?;
-        panel
-            .draw(&Text::new(
-                center_value,
-                (center.0 - value_w as i32 / 2, center.1 - 18),
-                value_style,
-            ))
-            .map_err(plotters_error)?;
-        panel
-            .draw(&Text::new(
-                center_caption,
-                (center.0 - caption_w as i32 / 2, center.1 + 10),
-                caption_style,
-            ))
-            .map_err(plotters_error)?;
+        draw_depth_center_text(&panel, center, total)?;
     }
-
-    draw_legend_entry(
-        &panel,
-        (24, 110),
-        PATHWAY_COLOR,
-        format!(
-            "Pathway rows: {} | {}",
-            format_percent(snapshot.layer_coverage.pathway_rows, total),
-            format_number(snapshot.layer_coverage.pathway_rows)
-        ),
-    )?;
-    draw_legend_entry(
-        &panel,
-        (24, 136),
-        SUPERCLASS_COLOR,
-        format!(
-            "Superclass rows: {} | {}",
-            format_percent(snapshot.layer_coverage.superclass_rows, total),
-            format_number(snapshot.layer_coverage.superclass_rows)
-        ),
-    )?;
-    draw_legend_entry(
-        &panel,
-        (24, 162),
-        CLASS_COLOR,
-        format!(
-            "Class rows: {} | {}",
-            format_percent(snapshot.layer_coverage.class_rows, total),
-            format_number(snapshot.layer_coverage.class_rows)
-        ),
-    )?;
+    draw_depth_legend(&panel, snapshot, total)?;
 
     Ok(())
 }
@@ -1127,7 +1153,7 @@ where
             RingOverlay {
                 outer_radius,
                 inner_radius: (outer_radius - ring_width).max(0.0),
-                value: snapshot.layer_coverage.pathway_rows,
+                value: snapshot.layer_coverage.pathway,
                 total,
                 color: PATHWAY_COLOR,
                 background: REMAINING_COLOR,
@@ -1135,7 +1161,7 @@ where
             RingOverlay {
                 outer_radius: outer_radius - ring_width - ring_gap,
                 inner_radius: (outer_radius - 2.0 * ring_width - ring_gap).max(0.0),
-                value: snapshot.layer_coverage.superclass_rows,
+                value: snapshot.layer_coverage.superclass,
                 total,
                 color: SUPERCLASS_COLOR,
                 background: REMAINING_COLOR,
@@ -1143,7 +1169,7 @@ where
             RingOverlay {
                 outer_radius: outer_radius - 2.0 * (ring_width + ring_gap),
                 inner_radius: (outer_radius - 3.0 * ring_width - 2.0 * ring_gap).max(0.0),
-                value: snapshot.layer_coverage.class_rows,
+                value: snapshot.layer_coverage.class,
                 total,
                 color: CLASS_COLOR,
                 background: REMAINING_COLOR,
@@ -1717,8 +1743,8 @@ fn full_ring_path(
 
 fn polar_point(center: (i32, i32), radius: f64, angle: f64) -> (f64, f64) {
     (
-        center.0 as f64 + radius * angle.cos(),
-        center.1 as f64 + radius * angle.sin(),
+        f64::from(center.0) + radius * angle.cos(),
+        f64::from(center.1) + radius * angle.sin(),
     )
 }
 
@@ -1775,10 +1801,12 @@ fn sanitize_identifier(value: &str) -> String {
         .collect()
 }
 
+#[allow(clippy::needless_pass_by_value)]
 fn json_error(error: serde_json::Error) -> io::Error {
     io::Error::other(error.to_string())
 }
 
+#[allow(clippy::needless_pass_by_value)]
 fn plotters_error<E>(error: DrawingAreaErrorKind<E>) -> io::Error
 where
     E: std::error::Error + Send + Sync + 'static,
@@ -1895,9 +1923,9 @@ mod tests {
         let (classified, empty, coverage, layers) = accumulator.into_layers();
         assert_eq!(classified, 1);
         assert_eq!(empty, 1);
-        assert_eq!(coverage.pathway_rows, 1);
-        assert_eq!(coverage.superclass_rows, 1);
-        assert_eq!(coverage.class_rows, 1);
+        assert_eq!(coverage.pathway, 1);
+        assert_eq!(coverage.superclass, 1);
+        assert_eq!(coverage.class, 1);
         assert_eq!(layers[0].assignment_total, 1);
         assert_eq!(layers[1].labels[0].label, "Nitrogen compounds");
         assert_eq!(layers[2].labels[0].label, "Alkaloids");
@@ -1931,7 +1959,7 @@ mod tests {
         let output = temp_dir.join("progress.svg");
         let snapshot = Snapshot {
             source_label: "latest Zenodo snapshot (10.5281/zenodo.14040990)".to_string(),
-            snapshot_label: Some("2026-04-14T12:00:00Z".to_string()),
+            timestamp_label: Some("2026-04-14T12:00:00Z".to_string()),
             counts: StatusCounts {
                 classified: 4,
                 empty: 1,
@@ -1941,9 +1969,9 @@ mod tests {
             },
             request_metrics: None,
             layer_coverage: LayerCoverage {
-                pathway_rows: 4,
-                superclass_rows: 3,
-                class_rows: 2,
+                pathway: 4,
+                superclass: 3,
+                class: 2,
             },
             layers: [
                 LayerBreakdown {
@@ -1996,7 +2024,7 @@ mod tests {
         let output = temp_dir.join("progress.png");
         let snapshot = Snapshot {
             source_label: "latest Zenodo snapshot (10.5281/zenodo.14040990)".to_string(),
-            snapshot_label: Some("2026-04-14T12:00:00Z".to_string()),
+            timestamp_label: Some("2026-04-14T12:00:00Z".to_string()),
             counts: StatusCounts {
                 classified: 4,
                 empty: 1,
@@ -2006,9 +2034,9 @@ mod tests {
             },
             request_metrics: None,
             layer_coverage: LayerCoverage {
-                pathway_rows: 4,
-                superclass_rows: 3,
-                class_rows: 2,
+                pathway: 4,
+                superclass: 3,
+                class: 2,
             },
             layers: [
                 LayerBreakdown {
