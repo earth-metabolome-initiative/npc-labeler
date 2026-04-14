@@ -48,4 +48,6 @@ If the published manifest does not include the PubChem total yet, pass `--pubche
 cargo run --bin npc-progress -- --pubchem-total 123541080 --output progress.svg
 ```
 
+The weekly GitHub Actions refresh currently uses the same explicit `--pubchem-total` value, because the latest published Zenodo manifest does not yet embed `pubchem_total`.
+
 Use `--zenodo-doi` to point at a different published snapshot family.

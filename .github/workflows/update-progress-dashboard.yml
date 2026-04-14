@@ -8,6 +8,7 @@ on:
 env:
   CARGO_TERM_COLOR: always
   NPC_LABELER_FONT_PATH: /usr/share/fonts/truetype/dejavu/DejaVuSans.ttf
+  PUBCHEM_TOTAL: "123541080"
 
 permissions:
   contents: write
@@ -30,8 +31,8 @@ jobs:
 
       - name: Regenerate dashboard
         run: |
-          cargo run --bin npc-progress -- --output zenodo-progress.svg
-          cargo run --bin npc-progress -- --output zenodo-progress.png
+          cargo run --bin npc-progress -- --pubchem-total "${PUBCHEM_TOTAL}" --output zenodo-progress.svg
+          cargo run --bin npc-progress -- --pubchem-total "${PUBCHEM_TOTAL}" --output zenodo-progress.png
 
       - name: Commit updated dashboard
         run: |
