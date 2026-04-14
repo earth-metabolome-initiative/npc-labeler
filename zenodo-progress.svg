@@ -467,7 +467,7 @@ Tail: 625 labels | 51.39% | 745,207
   <path fill="#82B88E" d="M 804.899 254.934 A 85.280 85.280 0 0 1 886.926 192.720 L 886.949 220.010 A 57.990 57.990 0 0 0 831.171 262.315 Z"/>
   <path fill="#DFAA48" d="M 886.926 192.720 A 85.280 85.280 0 0 1 886.997 192.720 L 886.998 220.010 A 57.990 57.990 0 0 0 886.949 220.010 Z"/>
   <path fill="#C85D49" d="M 886.997 192.720 A 85.280 85.280 0 0 1 887.000 192.720 L 887.000 220.010 A 57.990 57.990 0 0 0 886.998 220.010 Z"/>
-  <text x="887" y="260" dy="0.76em" text-anchor="middle" font-family="sans-serif" font-size="22.580645" opacity="1" fill="#293541">1,130,552</text>
+  <text x="887" y="260" dy="0.76em" text-anchor="middle" font-family="sans-serif" font-size="22.580645" opacity="1" fill="#293541">20.63%</text>
   <text x="887" y="290" dy="0.76em" text-anchor="middle" font-family="sans-serif" font-size="12.096774" opacity="1" fill="#6B7580">empty rows</text>
 </g>
 
@@ -478,7 +478,5 @@ Tail: 625 labels | 51.39% | 745,207
   <path fill="#DA953A" d="M 1450.000 203.540 A 74.460 74.460 0 0 1 1517.858 308.652 L 1501.572 301.295 A 56.590 56.590 0 0 0 1450.000 221.410 Z"/>
   <path fill="#CED5DD" d="M 1450.000 228.360 A 49.640 49.640 0 1 1 1450.000 327.640 A 49.640 49.640 0 1 1 1450.000 228.360 L 1450.000 246.230 A 31.770 31.770 0 1 0 1450.000 309.770 A 31.770 31.770 0 1 0 1450.000 246.230 Z"/>
   <path fill="#B25847" d="M 1450.000 228.360 A 49.640 49.640 0 0 1 1499.610 279.739 L 1481.750 279.113 A 31.770 31.770 0 0 0 1450.000 246.230 Z"/>
-  <text x="1450" y="260" dy="0.76em" text-anchor="middle" font-family="sans-serif" font-size="19.354839" opacity="1" fill="#293541">5,480,150</text>
-  <text x="1450" y="288" dy="0.76em" text-anchor="middle" font-family="sans-serif" font-size="12.096774" opacity="1" fill="#6B7580">successful rows</text>
 </g>
 </svg>

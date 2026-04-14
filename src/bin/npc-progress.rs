@@ -735,7 +735,7 @@ fn build_secondary_panel(snapshot: &Snapshot) -> MetricPanel {
             "{} terminal rows recorded in this source",
             format_number(snapshot.counts.executed())
         ),
-        center_value: format_number(snapshot.counts.empty),
+        center_value: format_percent(snapshot.counts.empty, snapshot.counts.executed()),
         center_caption: "empty rows".to_string(),
         footer_note: Some("Published manifest has no per-request totals.".to_string()),
         slices: vec![
@@ -928,41 +928,6 @@ where
     Ok(())
 }
 
-fn draw_depth_center_text<DB: DrawingBackend>(
-    panel: &DrawingArea<DB, Shift>,
-    center: (i32, i32),
-    total: u64,
-) -> io::Result<()>
-where
-    DB::ErrorType: std::error::Error + Send + Sync + 'static,
-{
-    let value_style = TextStyle::from(("sans-serif", 24).into_font()).color(&TEXT);
-    let caption_style = TextStyle::from(("sans-serif", 15).into_font()).color(&MUTED);
-    let center_value = format_number(total);
-    let center_caption = "successful rows";
-    let (value_w, _) = panel
-        .estimate_text_size(&center_value, &value_style)
-        .map_err(plotters_error)?;
-    let (caption_w, _) = panel
-        .estimate_text_size(center_caption, &caption_style)
-        .map_err(plotters_error)?;
-    panel
-        .draw(&Text::new(
-            center_value,
-            (center.0 - value_w as i32 / 2, center.1 - 18),
-            value_style,
-        ))
-        .map_err(plotters_error)?;
-    panel
-        .draw(&Text::new(
-            center_caption,
-            (center.0 - caption_w as i32 / 2, center.1 + 10),
-            caption_style,
-        ))
-        .map_err(plotters_error)?;
-    Ok(())
-}
-
 fn draw_depth_legend<DB: DrawingBackend>(
     panel: &DrawingArea<DB, Shift>,
     snapshot: &Snapshot,
@@ -1090,7 +1055,6 @@ where
             total,
             CLASS_COLOR,
         )?;
-        draw_depth_center_text(&panel, center, total)?;
     }
     draw_depth_legend(&panel, snapshot, total)?;
 
@@ -1175,22 +1139,7 @@ where
                 background: REMAINING_COLOR,
             },
         ],
-        text_lines: vec![
-            OverlayTextLine {
-                text: format_number(total),
-                center_x: center_abs.0,
-                y: center_abs.1 - 18,
-                font_size: 24.0,
-                color: TEXT,
-            },
-            OverlayTextLine {
-                text: "successful rows".to_string(),
-                center_x: center_abs.0,
-                y: center_abs.1 + 10,
-                font_size: 15.0,
-                color: MUTED,
-            },
-        ],
+        text_lines: Vec::new(),
     })
 }
 
