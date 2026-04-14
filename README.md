@@ -22,3 +22,26 @@ Run the same command again to resume after interruption.
 Successful classifications are written to `completed/` as chunked `jsonl.zst` files. Local resume state is stored under `state/`.
 
 On startup, the tool also prints an [ntfy](https://ntfy.sh) subscribe URL for progress notifications.
+
+## Progress Dashboard
+
+Render a single dashboard summarizing crawl coverage, terminal outcomes, and the top labels at each NPClassifier taxonomy layer:
+
+```bash
+cargo run --bin npc-progress -- --output progress.svg
+```
+
+The dashboard pulls the latest published snapshot from Zenodo through `zenodo-rs` and renders a single SVG or PNG report:
+
+```bash
+cargo run --bin npc-progress -- --output progress.svg
+cargo run --bin npc-progress -- --output progress.png
+```
+
+If the published manifest does not include the PubChem total yet, pass `--pubchem-total` or keep a local `CID-SMILES.gz` available so the tool can derive the crawl universe size:
+
+```bash
+cargo run --bin npc-progress -- --pubchem-total 123541080 --output progress.svg
+```
+
+Use `--zenodo-doi` to point at a different published snapshot family.

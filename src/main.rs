@@ -544,6 +544,7 @@ fn publish_to_zenodo(
         &config.completed_dir,
         &config.release_dir,
         chunk_index,
+        counts.total,
         counts.successful,
         counts.invalid,
         counts.failed,

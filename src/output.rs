@@ -53,6 +53,7 @@ struct Manifest<'a> {
     #[serde(rename = "dataset_schema_version")]
     schema_version: u32,
     created_at: String,
+    pubchem_total: u64,
     output_filename: &'a str,
     output_bytes: u64,
     output_sha256: &'a str,
@@ -317,6 +318,7 @@ pub fn build_release(
     completed_dir: &Path,
     release_dir: &Path,
     chunk_index: &ChunkIndex,
+    pubchem_total: u64,
     successful_rows: u64,
     invalid_rows: u64,
     failed_rows: u64,
@@ -368,6 +370,7 @@ pub fn build_release(
         version: MANIFEST_VERSION,
         schema_version: DATASET_SCHEMA_VERSION,
         created_at: Utc::now().to_rfc3339(),
+        pubchem_total,
         output_filename: COMPLETED_FILENAME,
         output_bytes: total_bytes,
         output_sha256: &output_sha256,
@@ -455,7 +458,7 @@ mod tests {
         assert!(state.is_terminal(2));
         assert_eq!(chunk_index.records().len(), 1);
 
-        let release = build_release(&completed_dir, &release_dir, &chunk_index, 2, 1, 0)
+        let release = build_release(&completed_dir, &release_dir, &chunk_index, 8, 2, 1, 0)
             .expect("build release");
         let merged = read_zstd_lines(&release.output_path);
         assert_eq!(merged.len(), 2);
@@ -465,6 +468,7 @@ mod tests {
         let manifest = read_to_string(&release.manifest_path).expect("read manifest");
         assert!(manifest.contains("\"manifest_version\":1"));
         assert!(manifest.contains("\"dataset_schema_version\":1"));
+        assert!(manifest.contains("\"pubchem_total\":8"));
         assert!(manifest.contains("\"successful_rows\":2"));
         assert!(manifest.contains(&chunk.filename));
     }

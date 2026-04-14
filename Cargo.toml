@@ -19,6 +19,7 @@ uuid = { version = "1", features = ["v4"] }
 dotenvy = "0.15"
 zstd = "0.13"
 zenodo-rs = "0.1.2"
+plotters = "0.3.7"
 
 [lints.clippy]
 pedantic = { level = "warn", priority = -1 }
