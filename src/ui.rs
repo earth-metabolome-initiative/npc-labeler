@@ -17,6 +17,7 @@ pub struct Ui {
     current_cid: Option<i32>,
     last_result: Option<String>,
     session_requests: u64,
+    in_flight_requests: usize,
 }
 
 pub struct TerminalGuard {
@@ -47,6 +48,7 @@ impl Ui {
             current_cid: None,
             last_result: None,
             session_requests: 0,
+            in_flight_requests: 0,
         }
     }
 
@@ -69,6 +71,11 @@ impl Ui {
             });
         }
         self.session_requests += 1;
+        self.in_flight_requests += 1;
+    }
+
+    pub fn note_request_completed(&mut self) {
+        self.in_flight_requests = self.in_flight_requests.saturating_sub(1);
     }
 
     pub fn note_classified(&mut self, cid: i32) {
@@ -100,7 +107,8 @@ impl Ui {
                 .map_or_else(|| "idle".to_string(), |cid| format!("CID {cid}"));
             let last_result = self.last_result.as_deref().unwrap_or("none");
             eprintln!(
-                "[progress] uptime={uptime}s | req_rate={rate:.1}/s | current={current} | last={last_result}"
+                "[progress] uptime={uptime}s | req_rate={rate:.1}/s | in_flight={} | current={current} | last={last_result}",
+                self.in_flight_requests
             );
             return;
         }
@@ -140,7 +148,10 @@ impl Ui {
                 "NPClassifier scraper    {}",
                 Local::now().format("%Y-%m-%d %H:%M:%S")
             ),
-            format!("uptime={}s | req_rate={:.2}/s", uptime, rate),
+            format!(
+                "uptime={}s | req_rate={:.2}/s | in_flight={}",
+                uptime, rate, self.in_flight_requests
+            ),
         ];
         if let Some(ntfy_url) = &self.ntfy_url {
             lines.push(format!("ntfy subscribe: {ntfy_url}"));
@@ -170,6 +181,7 @@ impl Ui {
             current_cid: None,
             last_result: None,
             session_requests: 0,
+            in_flight_requests: 0,
         }
     }
 
@@ -182,6 +194,7 @@ impl Ui {
             current_cid: None,
             last_result: None,
             session_requests: 0,
+            in_flight_requests: 0,
         }
     }
 }
@@ -229,6 +242,7 @@ mod tests {
             current_cid: None,
             last_result: None,
             session_requests: 0,
+            in_flight_requests: 0,
         };
 
         ui.note_current(
@@ -246,6 +260,7 @@ mod tests {
         );
         assert_eq!(ui.last_result.as_deref(), Some("classified CID 42"));
         assert_eq!(ui.session_requests, 1);
+        assert_eq!(ui.in_flight_requests, 1);
     }
 
     #[test]
@@ -258,6 +273,7 @@ mod tests {
             current_cid: Some(7),
             last_result: Some("empty CID 7".to_string()),
             session_requests: 3,
+            in_flight_requests: 1,
         };
 
         ui.render();
@@ -289,6 +305,8 @@ mod tests {
         assert_eq!(ui.last_result.as_deref(), Some("error CID 9: boom"));
         ui.note_rate_limit(10);
         assert_eq!(ui.last_result.as_deref(), Some("rate limited CID 10"));
+        ui.note_request_completed();
+        assert_eq!(ui.in_flight_requests, 0);
     }
 
     #[test]
@@ -299,6 +317,7 @@ mod tests {
         ui.current_cid = Some(7);
         ui.last_result = Some("empty CID 7".to_string());
         ui.session_requests = 3;
+        ui.in_flight_requests = 2;
 
         let lines = ui.dashboard_lines(1, 3.0);
         assert!(lines.iter().any(|line| line.contains("ntfy subscribe:")));

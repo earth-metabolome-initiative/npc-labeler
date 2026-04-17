@@ -7,11 +7,12 @@ mod test_support;
 mod ui;
 mod zenodo;
 
+use std::collections::BTreeMap;
 use std::fs::File;
 use std::io::{self, BufRead, BufReader};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -28,6 +29,7 @@ use ui::Ui;
 const COMPLETED_DIR: &str = "completed";
 const LOG_DIR: &str = "logs";
 const NTFY_BASE: &str = "https://ntfy.sh";
+const REQUEST_WORKERS_ENV: &str = "NPC_REQUEST_WORKERS";
 const PUBLISH_INTERVAL: Duration = Duration::from_hours(168);
 const RELEASE_DIR: &str = "releases";
 const RETRY_DELAYS: [Duration; 3] = [
@@ -41,6 +43,7 @@ const STATE_SYNC_INTERVAL: Duration = Duration::from_secs(5);
 const STATE_SYNC_ROWS: u64 = 1_000;
 const TARGET_CHUNK_BYTES: u64 = 128 * 1024 * 1024;
 const DASHBOARD_INTERVAL: Duration = Duration::from_secs(2);
+const MAX_REQUEST_WORKERS: usize = 16;
 
 #[derive(Clone)]
 struct RuntimeConfig {
@@ -54,11 +57,12 @@ struct RuntimeConfig {
     retry_delays: [Duration; 3],
     require_zenodo_token: bool,
     install_ctrlc: bool,
+    request_workers: usize,
 }
 
 impl RuntimeConfig {
-    fn production() -> Self {
-        Self {
+    fn production() -> io::Result<Self> {
+        Ok(Self {
             completed_dir: PathBuf::from(COMPLETED_DIR),
             state_dir: PathBuf::from(STATE_DIR),
             log_dir: PathBuf::from(LOG_DIR),
@@ -69,7 +73,8 @@ impl RuntimeConfig {
             retry_delays: RETRY_DELAYS,
             require_zenodo_token: true,
             install_ctrlc: true,
-        }
+            request_workers: request_workers_from_env()?.unwrap_or_else(default_request_workers),
+        })
     }
 }
 
@@ -121,6 +126,19 @@ struct RetryContext<'a> {
     shutdown: &'a AtomicBool,
 }
 
+struct RowTask {
+    line: LineIndex,
+    cid: i32,
+    smiles: String,
+}
+
+struct CompletedRow {
+    line: LineIndex,
+    cid: i32,
+    smiles: String,
+    outcome: RowOutcome,
+}
+
 fn main() {
     dotenvy::dotenv().ok();
 
@@ -132,7 +150,47 @@ fn main() {
 }
 
 fn run(args: &Args) -> io::Result<()> {
-    run_with_config(args, &RuntimeConfig::production())
+    run_with_config(args, &RuntimeConfig::production()?)
+}
+
+fn default_request_workers() -> usize {
+    std::thread::available_parallelism()
+        .map_or(4, |parallelism| parallelism.get())
+        .clamp(2, MAX_REQUEST_WORKERS)
+}
+
+fn request_workers_from_env() -> io::Result<Option<usize>> {
+    match std::env::var(REQUEST_WORKERS_ENV) {
+        Ok(raw) => {
+            let trimmed = raw.trim();
+            if trimmed.is_empty() {
+                return Ok(None);
+            }
+            let workers = trimmed.parse::<usize>().map_err(|error| {
+                io::Error::other(format!(
+                    "{REQUEST_WORKERS_ENV} must be a positive integer, got {trimmed:?}: {error}"
+                ))
+            })?;
+            if workers == 0 {
+                return Err(io::Error::other(format!(
+                    "{REQUEST_WORKERS_ENV} must be at least 1"
+                )));
+            }
+            Ok(Some(workers))
+        }
+        Err(std::env::VarError::NotPresent) => Ok(None),
+        Err(std::env::VarError::NotUnicode(_)) => Err(io::Error::other(format!(
+            "{REQUEST_WORKERS_ENV} must be valid UTF-8"
+        ))),
+    }
+}
+
+fn build_http_agent() -> ureq::Agent {
+    ureq::AgentBuilder::new()
+        .timeout_read(Duration::from_secs(15))
+        .timeout_write(Duration::from_secs(5))
+        .timeout_connect(Duration::from_secs(10))
+        .build()
 }
 
 #[allow(clippy::too_many_lines)]
@@ -163,12 +221,7 @@ fn run_with_config(args: &Args, config: &RuntimeConfig) -> io::Result<()> {
         install_ctrlc_handler(&shutdown)?;
     }
 
-    let agent = ureq::AgentBuilder::new()
-        .timeout_read(Duration::from_secs(15))
-        .timeout_write(Duration::from_secs(5))
-        .timeout_connect(Duration::from_secs(10))
-        .build();
-
+    let agent = build_http_agent();
     let ntfy_url = config
         .ntfy_base
         .as_ref()
@@ -203,122 +256,171 @@ fn run_with_config(args: &Args, config: &RuntimeConfig) -> io::Result<()> {
     let mut last_daily_status_date = None;
     let mut terminal_updates_since_sync = 0_u64;
     let mut line_index: LineIndex = 0;
+    let mut next_commit_line: LineIndex = 0;
+    let mut pending_results = BTreeMap::new();
+    let mut input_exhausted = false;
+    let mut dispatch_open = true;
+    let mut in_flight = 0_usize;
+    let mut interrupted = false;
+    let worker_count = config.request_workers.max(1);
     let use_default_api = config.api_url == api::DEFAULT_API_URL;
 
     let mut reader = open_input_reader(input_path)?;
     let mut line = String::new();
-    loop {
-        line.clear();
-        if reader.read_line(&mut line)? == 0 {
-            break;
-        }
 
-        if shutdown.load(Ordering::Relaxed) {
-            break;
-        }
+    thread::scope(|scope| -> io::Result<()> {
+        let (work_tx, work_rx) = mpsc::channel::<RowTask>();
+        let work_rx = Arc::new(Mutex::new(work_rx));
+        let (result_tx, result_rx) = mpsc::channel::<CompletedRow>();
 
-        if last_publish.elapsed() >= config.publish_interval {
-            publish_to_zenodo(
+        for _ in 0..worker_count {
+            let work_rx = Arc::clone(&work_rx);
+            let result_tx = result_tx.clone();
+            let api_url = config.api_url.clone();
+            let retry_delays = config.retry_delays;
+            let shutdown = Arc::clone(&shutdown);
+            scope.spawn(move || {
+                run_request_worker(
+                    work_rx,
+                    result_tx,
+                    api_url,
+                    use_default_api,
+                    retry_delays,
+                    shutdown,
+                );
+            });
+        }
+        drop(result_tx);
+
+        let mut work_tx = Some(work_tx);
+        while dispatch_open || in_flight > 0 || !pending_results.is_empty() {
+            while dispatch_open && !shutdown.load(Ordering::Relaxed) && in_flight < worker_count {
+                if last_publish.elapsed() >= config.publish_interval {
+                    publish_to_zenodo(
+                        &mut writer,
+                        &mut state,
+                        &mut chunk_index,
+                        counts,
+                        config,
+                        zenodo_token.as_deref(),
+                        &agent,
+                        ntfy_url.as_deref(),
+                    )?;
+                    last_publish = Instant::now();
+                }
+
+                line.clear();
+                if reader.read_line(&mut line)? == 0 {
+                    input_exhausted = true;
+                    dispatch_open = false;
+                    break;
+                }
+
+                let Some((cid, smiles)) = parse_input_line(&line) else {
+                    continue;
+                };
+
+                let current_line = line_index;
+                line_index = line_index
+                    .checked_add(1)
+                    .ok_or_else(|| io::Error::other("line index overflow"))?;
+
+                if state.is_terminal(current_line) {
+                    continue;
+                }
+
+                ui.note_current(cid, smiles);
+                work_tx
+                    .as_ref()
+                    .ok_or_else(|| io::Error::other("request worker queue closed"))?
+                    .send(RowTask {
+                        line: current_line,
+                        cid,
+                        smiles: smiles.to_string(),
+                    })
+                    .map_err(|_| io::Error::other("request worker queue closed"))?;
+                in_flight += 1;
+            }
+
+            if shutdown.load(Ordering::Relaxed) {
+                dispatch_open = false;
+            }
+            if !dispatch_open && work_tx.is_some() {
+                drop(work_tx.take());
+            }
+
+            interrupted |= drain_ready_rows(
+                &mut pending_results,
+                &mut next_commit_line,
+                line_index,
                 &mut writer,
                 &mut state,
-                &mut chunk_index,
-                counts,
-                config,
-                zenodo_token.as_deref(),
+                &mut failure_log,
+                &mut counts,
+                &mut ui,
+                &mut terminal_updates_since_sync,
+            )?;
+
+            if terminal_updates_since_sync >= STATE_SYNC_ROWS
+                || last_state_sync.elapsed() >= STATE_SYNC_INTERVAL
+            {
+                sync_runtime_state(&mut writer, &mut state, &mut chunk_index)?;
+                terminal_updates_since_sync = 0;
+                last_state_sync = Instant::now();
+            }
+
+            maybe_notify_daily_status(
                 &agent,
                 ntfy_url.as_deref(),
-            )?;
-            last_publish = Instant::now();
-        }
+                counts,
+                &mut last_daily_status_date,
+            );
 
-        let Some((cid, smiles)) = parse_input_line(&line) else {
-            continue;
-        };
+            if last_dashboard.elapsed() >= DASHBOARD_INTERVAL {
+                ui.render();
+                let pct = percent(counts.processed(), counts.total);
+                if pct > last_notified_pct {
+                    notify(
+                        &agent,
+                        ntfy_url.as_deref(),
+                        &format!("{pct}% -- {}/{}", counts.processed(), counts.total),
+                    );
+                    last_notified_pct = pct;
+                }
+                last_dashboard = Instant::now();
+            }
 
-        let current_line = line_index;
-        line_index = line_index
-            .checked_add(1)
-            .ok_or_else(|| io::Error::other("line index overflow"))?;
+            if interrupted {
+                dispatch_open = false;
+            }
+            if !dispatch_open && in_flight == 0 {
+                break;
+            }
+            if in_flight == 0 {
+                continue;
+            }
 
-        if state.is_terminal(current_line) {
-            continue;
-        }
-
-        ui.note_current(cid, smiles);
-        match classify_with_retry(
-            &RetryContext {
-                agent: &agent,
-                api_url: &config.api_url,
-                use_default_api,
-                retry_delays: &config.retry_delays,
-                shutdown: &shutdown,
-            },
-            cid,
-            smiles,
-            &mut ui,
-        ) {
-            RowOutcome::Success(response) => {
-                let has_labels = has_labels(&response);
-                writer.append(current_line, cid, smiles, response)?;
-                counts.successful += 1;
-                terminal_updates_since_sync += 1;
-                if has_labels {
-                    ui.note_classified(cid);
-                } else {
-                    ui.note_empty(cid);
+            match result_rx.recv_timeout(Duration::from_millis(100)) {
+                Ok(result) => {
+                    in_flight = in_flight.saturating_sub(1);
+                    ui.note_request_completed();
+                    pending_results.insert(result.line, result);
+                }
+                Err(mpsc::RecvTimeoutError::Timeout) => {}
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    if in_flight > 0 {
+                        return Err(io::Error::other(
+                            "request workers exited before returning all results",
+                        ));
+                    }
                 }
             }
-            RowOutcome::Invalid => {
-                state.mark_invalid(current_line);
-                counts.invalid += 1;
-                terminal_updates_since_sync += 1;
-                ui.note_invalid(cid);
-            }
-            RowOutcome::Failed {
-                attempt,
-                kind,
-                message,
-            } => {
-                state.mark_failed(current_line);
-                failure_log.log(current_line, cid, smiles, &kind, &message, attempt)?;
-                counts.failed += 1;
-                terminal_updates_since_sync += 1;
-                ui.note_error(cid, &message);
-            }
-            RowOutcome::Interrupted => break,
         }
 
-        if terminal_updates_since_sync >= STATE_SYNC_ROWS
-            || last_state_sync.elapsed() >= STATE_SYNC_INTERVAL
-        {
-            sync_runtime_state(&mut writer, &mut state, &mut chunk_index)?;
-            terminal_updates_since_sync = 0;
-            last_state_sync = Instant::now();
-        }
+        Ok(())
+    })?;
 
-        maybe_notify_daily_status(
-            &agent,
-            ntfy_url.as_deref(),
-            counts,
-            &mut last_daily_status_date,
-        );
-
-        if last_dashboard.elapsed() >= DASHBOARD_INTERVAL {
-            ui.render();
-            let pct = percent(counts.processed(), counts.total);
-            if pct > last_notified_pct {
-                notify(
-                    &agent,
-                    ntfy_url.as_deref(),
-                    &format!("{pct}% -- {}/{}", counts.processed(), counts.total),
-                );
-                last_notified_pct = pct;
-            }
-            last_dashboard = Instant::now();
-        }
-    }
-
-    if !shutdown.load(Ordering::Relaxed) && line_index != total_rows {
+    if !shutdown.load(Ordering::Relaxed) && input_exhausted && line_index != total_rows {
         return Err(io::Error::other(format!(
             "counted {total_rows} valid rows during prepass but streamed {line_index}"
         )));
@@ -343,12 +445,136 @@ fn run_with_config(args: &Args, config: &RuntimeConfig) -> io::Result<()> {
     Ok(())
 }
 
-fn classify_with_retry(
-    context: &RetryContext<'_>,
-    cid: i32,
-    smiles: &str,
+fn run_request_worker(
+    work_rx: Arc<Mutex<mpsc::Receiver<RowTask>>>,
+    result_tx: mpsc::Sender<CompletedRow>,
+    api_url: String,
+    use_default_api: bool,
+    retry_delays: [Duration; 3],
+    shutdown: Arc<AtomicBool>,
+) {
+    let agent = build_http_agent();
+    loop {
+        let task = match work_rx.lock().expect("lock request queue").recv() {
+            Ok(task) => task,
+            Err(_) => break,
+        };
+
+        let outcome = classify_with_retry(
+            &RetryContext {
+                agent: &agent,
+                api_url: &api_url,
+                use_default_api,
+                retry_delays: &retry_delays,
+                shutdown: &shutdown,
+            },
+            &task.smiles,
+        );
+        if result_tx
+            .send(CompletedRow {
+                line: task.line,
+                cid: task.cid,
+                smiles: task.smiles,
+                outcome,
+            })
+            .is_err()
+        {
+            break;
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn drain_ready_rows(
+    pending_results: &mut BTreeMap<LineIndex, CompletedRow>,
+    next_commit_line: &mut LineIndex,
+    read_limit: LineIndex,
+    writer: &mut ChunkWriter,
+    state: &mut StateStore,
+    failure_log: &mut FailureLogger,
+    counts: &mut RuntimeCounts,
     ui: &mut Ui,
-) -> RowOutcome {
+    terminal_updates_since_sync: &mut u64,
+) -> io::Result<bool> {
+    while *next_commit_line < read_limit {
+        if state.is_terminal(*next_commit_line) {
+            *next_commit_line += 1;
+            continue;
+        }
+
+        let Some(result) = pending_results.remove(next_commit_line) else {
+            return Ok(false);
+        };
+        if apply_completed_row(
+            result,
+            writer,
+            state,
+            failure_log,
+            counts,
+            ui,
+            terminal_updates_since_sync,
+        )? {
+            return Ok(true);
+        }
+        *next_commit_line += 1;
+    }
+
+    Ok(false)
+}
+
+fn apply_completed_row(
+    result: CompletedRow,
+    writer: &mut ChunkWriter,
+    state: &mut StateStore,
+    failure_log: &mut FailureLogger,
+    counts: &mut RuntimeCounts,
+    ui: &mut Ui,
+    terminal_updates_since_sync: &mut u64,
+) -> io::Result<bool> {
+    match result.outcome {
+        RowOutcome::Success(response) => {
+            let has_labels = has_labels(&response);
+            writer.append(result.line, result.cid, &result.smiles, response)?;
+            counts.successful += 1;
+            *terminal_updates_since_sync += 1;
+            if has_labels {
+                ui.note_classified(result.cid);
+            } else {
+                ui.note_empty(result.cid);
+            }
+            Ok(false)
+        }
+        RowOutcome::Invalid => {
+            state.mark_invalid(result.line);
+            counts.invalid += 1;
+            *terminal_updates_since_sync += 1;
+            ui.note_invalid(result.cid);
+            Ok(false)
+        }
+        RowOutcome::Failed {
+            attempt,
+            kind,
+            message,
+        } => {
+            state.mark_failed(result.line);
+            failure_log.log(
+                result.line,
+                result.cid,
+                &result.smiles,
+                &kind,
+                &message,
+                attempt,
+            )?;
+            counts.failed += 1;
+            *terminal_updates_since_sync += 1;
+            ui.note_error(result.cid, &message);
+            Ok(false)
+        }
+        RowOutcome::Interrupted => Ok(true),
+    }
+}
+
+fn classify_with_retry(context: &RetryContext<'_>, smiles: &str) -> RowOutcome {
     let mut attempt = 1_u8;
     loop {
         let result = if context.use_default_api {
@@ -367,12 +593,6 @@ fn classify_with_retry(
                         message: error.message(),
                     };
                 };
-
-                if matches!(&error, ClassifyError::RateLimit) {
-                    ui.note_rate_limit(cid);
-                } else {
-                    ui.note_error(cid, &format!("{error}; retrying in {}s", delay.as_secs()));
-                }
 
                 if sleep_with_shutdown(*delay, context.shutdown) {
                     return RowOutcome::Interrupted;
@@ -417,7 +637,7 @@ fn install_ctrlc_handler(shutdown: &Arc<AtomicBool>) -> io::Result<()> {
             eprintln!("\nForce exit.");
             std::process::exit(1);
         }
-        eprintln!("\nShutdown requested, finishing current request...");
+        eprintln!("\nShutdown requested, finishing in-flight requests...");
         signal.store(true, Ordering::SeqCst);
     })
     .map_err(|error| io::Error::other(error.to_string()))
@@ -682,6 +902,7 @@ mod tests {
             ],
             require_zenodo_token: false,
             install_ctrlc: false,
+            request_workers: 2,
         };
         let args = Args {
             input: input_path.to_string_lossy().into_owned(),
@@ -723,7 +944,55 @@ mod tests {
     }
 
     #[test]
+    fn run_with_config_overlaps_requests_and_keeps_output_ordered() {
+        let temp_dir = TestDir::new("run-concurrent");
+        let input_path = temp_dir.path().join("CID-SMILES.txt");
+        std::fs::write(&input_path, "1\tCCO\n2\tCCC\n3\tCCN\n").expect("write input file");
+
+        let response_body = r#"{"class_results":["lipid"],"superclass_results":[],"pathway_results":[],"isglycoside":false}"#;
+        let server = MockHttpServer::spawn(vec![
+            MockResponse::json("200 OK", response_body).with_delay(Duration::from_millis(100)),
+            MockResponse::json("200 OK", response_body).with_delay(Duration::from_millis(100)),
+            MockResponse::json("200 OK", response_body),
+        ]);
+        let config = RuntimeConfig {
+            completed_dir: temp_dir.path().join("completed"),
+            state_dir: temp_dir.path().join("state"),
+            log_dir: temp_dir.path().join("logs"),
+            release_dir: temp_dir.path().join("releases"),
+            api_url: server.url("/classify"),
+            ntfy_base: None,
+            publish_interval: Duration::from_hours(168),
+            retry_delays: [Duration::from_millis(0); 3],
+            require_zenodo_token: false,
+            install_ctrlc: false,
+            request_workers: 2,
+        };
+        let args = Args {
+            input: input_path.to_string_lossy().into_owned(),
+        };
+
+        run_with_config(&args, &config).expect("run concurrent pipeline");
+
+        let chunk_path = config.completed_dir.join("part-000001.jsonl.zst");
+        let decoder = Decoder::new(File::open(&chunk_path).expect("open chunk")).expect("decoder");
+        let lines = BufReader::new(decoder)
+            .lines()
+            .collect::<Result<Vec<_>, _>>()
+            .expect("read completed records");
+        assert_eq!(lines.len(), 3);
+        assert!(lines[0].contains("\"cid\":1"));
+        assert!(lines[1].contains("\"cid\":2"));
+        assert!(lines[2].contains("\"cid\":3"));
+        assert!(server.max_active_requests() >= 2);
+    }
+
+    #[test]
     fn runtime_helpers_cover_counts_and_percent() {
+        let _guard = env_lock();
+        unsafe {
+            std::env::remove_var(REQUEST_WORKERS_ENV);
+        }
         let counts = RuntimeCounts {
             total: 10,
             successful: 3,
@@ -746,7 +1015,7 @@ mod tests {
             pathway_results: Vec::new(),
             isglycoside: false,
         }));
-        let config = RuntimeConfig::production();
+        let config = RuntimeConfig::production().expect("production config");
         assert_eq!(config.completed_dir, PathBuf::from(COMPLETED_DIR));
         assert_eq!(config.state_dir, PathBuf::from(STATE_DIR));
         assert_eq!(config.log_dir, PathBuf::from(LOG_DIR));
@@ -755,6 +1024,37 @@ mod tests {
         assert!(config.ntfy_base.is_some());
         assert!(config.require_zenodo_token);
         assert!(config.install_ctrlc);
+        assert!((2..=MAX_REQUEST_WORKERS).contains(&config.request_workers));
+    }
+
+    #[test]
+    fn request_workers_from_env_accepts_valid_values_and_rejects_bad_ones() {
+        let _guard = env_lock();
+        unsafe {
+            std::env::remove_var(REQUEST_WORKERS_ENV);
+        }
+        assert_eq!(request_workers_from_env().expect("unset env"), None);
+
+        unsafe {
+            std::env::set_var(REQUEST_WORKERS_ENV, "7");
+        }
+        assert_eq!(request_workers_from_env().expect("valid env"), Some(7));
+
+        unsafe {
+            std::env::set_var(REQUEST_WORKERS_ENV, "0");
+        }
+        let error = request_workers_from_env().expect_err("zero workers should fail");
+        assert!(error.to_string().contains("at least 1"));
+
+        unsafe {
+            std::env::set_var(REQUEST_WORKERS_ENV, "nope");
+        }
+        let error = request_workers_from_env().expect_err("invalid worker count should fail");
+        assert!(error.to_string().contains(REQUEST_WORKERS_ENV));
+
+        unsafe {
+            std::env::remove_var(REQUEST_WORKERS_ENV);
+        }
     }
 
     #[test]
@@ -836,8 +1136,6 @@ mod tests {
         ]);
         let agent = ureq::AgentBuilder::new().build();
         let shutdown = AtomicBool::new(false);
-        let mut ui = Ui::test_noninteractive();
-
         let outcome = classify_with_retry(
             &RetryContext {
                 agent: &agent,
@@ -846,9 +1144,7 @@ mod tests {
                 retry_delays: &[Duration::from_millis(0); 3],
                 shutdown: &shutdown,
             },
-            77,
             "CCO",
-            &mut ui,
         );
 
         match outcome {
@@ -871,8 +1167,6 @@ mod tests {
         let server = MockHttpServer::spawn(vec![MockResponse::empty("429 Too Many Requests")]);
         let agent = ureq::AgentBuilder::new().build();
         let shutdown = AtomicBool::new(true);
-        let mut ui = Ui::test_noninteractive();
-
         let outcome = classify_with_retry(
             &RetryContext {
                 agent: &agent,
@@ -885,9 +1179,7 @@ mod tests {
                 ],
                 shutdown: &shutdown,
             },
-            88,
             "CCO",
-            &mut ui,
         );
 
         assert!(matches!(outcome, RowOutcome::Interrupted));
@@ -938,6 +1230,7 @@ mod tests {
             retry_delays: [Duration::from_millis(0); 3],
             require_zenodo_token: false,
             install_ctrlc: false,
+            request_workers: 2,
         };
 
         run_with_config(&args, &config).expect("no-op run");
@@ -1035,6 +1328,7 @@ mod tests {
             retry_delays: [Duration::from_millis(0); 3],
             require_zenodo_token: false,
             install_ctrlc: false,
+            request_workers: 2,
         };
         let args = Args {
             input: input_path.to_string_lossy().into_owned(),
@@ -1124,6 +1418,7 @@ mod tests {
             retry_delays: [Duration::from_millis(0); 3],
             require_zenodo_token: false,
             install_ctrlc: false,
+            request_workers: 1,
         };
         let counts = RuntimeCounts {
             total: 1,

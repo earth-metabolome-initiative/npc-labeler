@@ -6,8 +6,10 @@ use std::fs::{create_dir_all, remove_dir_all};
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
+use std::time::Duration;
 
 use uuid::Uuid;
 
@@ -23,6 +25,7 @@ pub struct MockResponse {
     status: String,
     headers: Vec<(String, String)>,
     body: Vec<u8>,
+    delay: Duration,
 }
 
 impl MockResponse {
@@ -31,6 +34,7 @@ impl MockResponse {
             status: status.to_string(),
             headers: vec![("Content-Type".to_string(), "application/json".to_string())],
             body: body.as_bytes().to_vec(),
+            delay: Duration::ZERO,
         }
     }
 
@@ -39,10 +43,19 @@ impl MockResponse {
             status: status.to_string(),
             headers: Vec::new(),
             body: Vec::new(),
+            delay: Duration::ZERO,
         }
     }
 
+    pub fn with_delay(mut self, delay: Duration) -> Self {
+        self.delay = delay;
+        self
+    }
+
     fn write_to(self, stream: &mut TcpStream) {
+        if !self.delay.is_zero() {
+            thread::sleep(self.delay);
+        }
         let mut response = format!(
             "HTTP/1.1 {}\r\nConnection: close\r\nContent-Length: {}\r\n",
             self.status,
@@ -65,6 +78,7 @@ impl MockResponse {
 pub struct MockHttpServer {
     base_url: String,
     requests: Arc<Mutex<Vec<RecordedRequest>>>,
+    max_active_requests: Arc<AtomicUsize>,
     join_handle: Option<thread::JoinHandle<()>>,
 }
 
@@ -92,23 +106,36 @@ impl MockHttpServer {
         responses: Vec<MockResponse>,
     ) -> Self {
         let requests = Arc::new(Mutex::new(Vec::new()));
+        let active_requests = Arc::new(AtomicUsize::new(0));
+        let max_active_requests = Arc::new(AtomicUsize::new(0));
         let request_store = Arc::clone(&requests);
+        let active_counter = Arc::clone(&active_requests);
+        let max_active_counter = Arc::clone(&max_active_requests);
         let mut queued = VecDeque::from(responses);
         let join_handle = thread::spawn(move || {
             while let Some(response) = queued.pop_front() {
                 let (mut stream, _) = listener.accept().expect("accept mock request");
-                let request = read_request(&mut stream).expect("read mock request");
-                request_store
-                    .lock()
-                    .expect("lock request store")
-                    .push(request);
-                response.write_to(&mut stream);
+                let request_store = Arc::clone(&request_store);
+                let active_counter = Arc::clone(&active_counter);
+                let max_active_counter = Arc::clone(&max_active_counter);
+                thread::spawn(move || {
+                    let active = active_counter.fetch_add(1, Ordering::SeqCst) + 1;
+                    observe_max(&max_active_counter, active);
+                    let request = read_request(&mut stream).expect("read mock request");
+                    request_store
+                        .lock()
+                        .expect("lock request store")
+                        .push(request);
+                    response.write_to(&mut stream);
+                    active_counter.fetch_sub(1, Ordering::SeqCst);
+                });
             }
         });
 
         Self {
             base_url,
             requests,
+            max_active_requests,
             join_handle: Some(join_handle),
         }
     }
@@ -122,6 +149,10 @@ impl MockHttpServer {
             .lock()
             .expect("lock recorded requests")
             .clone()
+    }
+
+    pub fn max_active_requests(&self) -> usize {
+        self.max_active_requests.load(Ordering::SeqCst)
     }
 }
 
@@ -228,6 +259,21 @@ fn read_request(stream: &mut TcpStream) -> std::io::Result<RecordedRequest> {
     };
 
     Ok(RecordedRequest { method, path, body })
+}
+
+fn observe_max(max_active_requests: &AtomicUsize, active: usize) {
+    let mut current = max_active_requests.load(Ordering::SeqCst);
+    while active > current {
+        match max_active_requests.compare_exchange(
+            current,
+            active,
+            Ordering::SeqCst,
+            Ordering::SeqCst,
+        ) {
+            Ok(_) => break,
+            Err(observed) => current = observed,
+        }
+    }
 }
 
 fn find_subsequence(haystack: &[u8], needle: &[u8]) -> Option<usize> {
