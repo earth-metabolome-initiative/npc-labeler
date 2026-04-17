@@ -94,10 +94,6 @@ impl Ui {
         self.last_result = Some(format!("error CID {cid}: {error}"));
     }
 
-    pub fn note_rate_limit(&mut self, cid: i32) {
-        self.last_result = Some(format!("rate limited CID {cid}"));
-    }
-
     pub fn render(&mut self) {
         if !self.interactive {
             let uptime = self.started_at.elapsed().as_secs().max(1);
@@ -303,8 +299,6 @@ mod tests {
         assert_eq!(ui.last_result.as_deref(), Some("invalid CID 8"));
         ui.note_error(9, "boom");
         assert_eq!(ui.last_result.as_deref(), Some("error CID 9: boom"));
-        ui.note_rate_limit(10);
-        assert_eq!(ui.last_result.as_deref(), Some("rate limited CID 10"));
         ui.note_request_completed();
         assert_eq!(ui.in_flight_requests, 0);
     }

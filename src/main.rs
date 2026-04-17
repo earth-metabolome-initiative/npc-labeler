@@ -155,7 +155,7 @@ fn run(args: &Args) -> io::Result<()> {
 
 fn default_request_workers() -> usize {
     std::thread::available_parallelism()
-        .map_or(4, |parallelism| parallelism.get())
+        .map_or(4, std::num::NonZeroUsize::get)
         .clamp(2, MAX_REQUEST_WORKERS)
 }
 
@@ -281,12 +281,12 @@ fn run_with_config(args: &Args, config: &RuntimeConfig) -> io::Result<()> {
             let shutdown = Arc::clone(&shutdown);
             scope.spawn(move || {
                 run_request_worker(
-                    work_rx,
-                    result_tx,
-                    api_url,
+                    &work_rx,
+                    &result_tx,
+                    &api_url,
                     use_default_api,
                     retry_delays,
-                    shutdown,
+                    &shutdown,
                 );
             });
         }
@@ -446,27 +446,26 @@ fn run_with_config(args: &Args, config: &RuntimeConfig) -> io::Result<()> {
 }
 
 fn run_request_worker(
-    work_rx: Arc<Mutex<mpsc::Receiver<RowTask>>>,
-    result_tx: mpsc::Sender<CompletedRow>,
-    api_url: String,
+    work_rx: &Arc<Mutex<mpsc::Receiver<RowTask>>>,
+    result_tx: &mpsc::Sender<CompletedRow>,
+    api_url: &str,
     use_default_api: bool,
     retry_delays: [Duration; 3],
-    shutdown: Arc<AtomicBool>,
+    shutdown: &Arc<AtomicBool>,
 ) {
     let agent = build_http_agent();
     loop {
-        let task = match work_rx.lock().expect("lock request queue").recv() {
-            Ok(task) => task,
-            Err(_) => break,
+        let Ok(task) = work_rx.lock().expect("lock request queue").recv() else {
+            break;
         };
 
         let outcome = classify_with_retry(
             &RetryContext {
                 agent: &agent,
-                api_url: &api_url,
+                api_url,
                 use_default_api,
                 retry_delays: &retry_delays,
-                shutdown: &shutdown,
+                shutdown,
             },
             &task.smiles,
         );
