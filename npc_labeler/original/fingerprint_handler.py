@@ -1,6 +1,8 @@
 import numpy as np
-from rdkit import Chem
+from rdkit import Chem, RDLogger
 from rdkit.Chem import rdMolDescriptors
+
+RDLogger.DisableLog("rdApp.warning")
 
 
 #Fingerprint generation
