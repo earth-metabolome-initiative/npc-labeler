@@ -6,23 +6,23 @@ on:
   pull_request:
     branches: [main]
 
-env:
-  CARGO_TERM_COLOR: always
-
 jobs:
   check:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-python@v5
         with:
-          components: clippy, rustfmt
-      - uses: Swatinem/rust-cache@v2
-      - name: fmt
-        run: cargo fmt --check
-      - name: clippy
-        run: cargo clippy -- -D warnings
-      - name: test
-        run: cargo test
-      - name: build
-        run: cargo build --release
+          python-version: "3.12"
+      - name: python deps
+        run: python -m pip install --upgrade pip && python -m pip install "numpy<2" h5py pandas pyarrow requests tqdm zstandard ruff mypy
+      - name: ruff
+        run: ruff check npc_labeler tests
+      - name: mypy
+        run: mypy
+      - name: python compile
+        run: python -m compileall npc_labeler tests
+      - name: python tests
+        run: python -m unittest discover -s tests
+      - name: docker build
+        run: docker build -t npc-labeler .

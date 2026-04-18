@@ -1,0 +1,35 @@
+[project]
+name = "npc-labeler"
+version = "0.0.0"
+requires-python = ">=3.12"
+
+[tool.ruff]
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I"]
+ignore = ["E501"]
+
+[tool.mypy]
+python_version = "3.12"
+files = ["npc_labeler", "tests"]
+check_untyped_defs = true
+warn_unused_configs = true
+warn_unused_ignores = true
+
+[[tool.mypy.overrides]]
+module = [
+  "h5py",
+  "numpy",
+  "pyarrow",
+  "pyarrow.*",
+  "rdkit",
+  "rdkit.*",
+  "requests",
+  "zstandard",
+]
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+module = ["npc_labeler.original.*"]
+ignore_errors = true
