@@ -3,6 +3,7 @@ from rdkit import Chem, RDLogger
 from rdkit.Chem import rdMolDescriptors
 
 RDLogger.DisableLog("rdApp.warning")
+RDLogger.DisableLog("rdApp.error")
 
 
 #Fingerprint generation
