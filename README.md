@@ -12,6 +12,8 @@ This repo exists because the original [`mwang87/NP-Classifier`](https://github.c
 
 This pipeline keeps the job simple: one container, one pinned environment, one offline pass over PubChem, 10M-row Parquet chunks for row metadata, and separate `float16` score matrices compressed with `zstd`.
 
+Before scaling out, this pipeline was validated against the public NPClassifier API snapshot for the first 10,000 PubChem rows. For aligned PubChem CIDs, the local run matched the API-visible `smiles`, `pathway_results`, `superclass_results`, `class_results`, and `isglycoside` outputs exactly. That validation does not cover byte-identical raw score vectors, which are not public, but the exact match of the API-visible outputs is a strong indication that the model and RDKit versions are correctly pinned.
+
 ```bash
 docker build -t npc-labeler .
 docker run --rm -it \
